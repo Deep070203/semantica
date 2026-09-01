@@ -101,6 +101,13 @@ jobs:
           #   cuda-toolkit.
           IGNORED_VULN_IDS="SFTY-20260120-40557"
 
+          # Exported so the "Comment PR with Security Results" step below can
+          # apply the same exclusion list to the raw report - it reads
+          # safety-report.json independently in JS, so without this the PR
+          # comment would show the accepted CVE as a live finding even though
+          # this gate correctly treats it as non-actionable.
+          echo "IGNORED_VULN_IDS=$IGNORED_VULN_IDS" >> "$GITHUB_ENV"
+
           # No []? / || echo "0" fallback on a missing/null "vulnerabilities"
           # key: iterating over null raises inside jq, leaving VULNS empty, so
           # guard 2 below catches it rather than silently treating a broken
@@ -221,14 +228,27 @@ jobs:
               return lines.join('\n');
             }
 
+            // Mirrors the shell step's own IGNORED_VULN_IDS (passed through
+            // $GITHUB_ENV) so an accepted, non-actionable CVE that the CI
+            // gate already excluded doesn't reappear here as a live finding -
+            // this reads the same raw, unfiltered safety-report.json.
+            const ignoredVulnIds = (process.env.IGNORED_VULN_IDS || '')
+              .split(',')
+              .map((id) => id.trim())
+              .filter(Boolean);
+
             const safetySection = renderSection(
               'Safety — dependency vulnerabilities',
               'safety-report.json',
-              (data) => (data.vulnerabilities || []).map(
-                (v) => `- \`${v.package_name}==${v.analyzed_version}\`: ${v.vulnerability_id}` +
-                  (v.CVE ? ` (${v.CVE})` : '') + ` — ${v.advisory || 'no advisory text'}`
-              )
-            );
+              (data) => (data.vulnerabilities || [])
+                .filter((v) => !ignoredVulnIds.includes(v.vulnerability_id))
+                .map(
+                  (v) => `- \`${v.package_name}==${v.analyzed_version}\`: ${v.vulnerability_id}` +
+                    (v.CVE ? ` (${v.CVE})` : '') + ` — ${v.advisory || 'no advisory text'}`
+                )
+            ) + (ignoredVulnIds.length
+              ? `\n\n_Excluded as accepted, non-actionable findings: ${ignoredVulnIds.join(', ')} — see the workflow file's inline comments for why._`
+              : '');
 
             const banditSection = renderSection(
               'Bandit — HIGH-severity code issues',
