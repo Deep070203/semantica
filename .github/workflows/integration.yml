@@ -1,0 +1,91 @@
+name: Integration Tests
+
+# Separate from ci.yml, which is a required check: a slow image pull or a
+# container flake must not block unrelated merges.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'docs_check.py'
+      - '**/*.md'
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+jobs:
+  pgvector:
+    name: pgvector (live PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # pgvector/pgvector:pg16 as published 2026-08-13. Pinned by digest like
+        # the action pins, though verify-action-pins.sh does not check images.
+        image: pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_DB: test
+          # Throwaway container reachable only from this job, so trust auth
+          # avoids putting a credential in the workflow at all.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_PGVECTOR_URL: postgresql://postgres@localhost:5432/test
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install semantica with the pgvector extra
+        # Hash-verified installs throughout, matching ci.yml/security.yml/etc
+        # (OpenSSF Scorecard's Pinned-Dependencies check). --no-deps here
+        # skips runtime dependency resolution for the editable install itself
+        # (nothing to hash); pep517-build.txt + --no-build-isolation stops
+        # its PEP 517 build from separately fetching an unhashed
+        # setuptools/wheel via build isolation.
+        run: |
+          pip install -r .github/requirements/bootstrap.txt --require-hashes
+          pip install -r .github/requirements/pep517-build.txt --require-hashes
+          pip install --no-deps --no-build-isolation -e .
+          pip install -r .github/requirements/pgvector-extra.txt --require-hashes
+          pip install -r .github/requirements/pytest-tool.txt --require-hashes
+
+      - name: Create the vector extension
+        # PgVectorStore._verify_pgvector_extension() requires it and refuses to
+        # create it. Doubles as the connectivity gate.
+        run: |
+          python - <<'PY'
+          import os
+
+          import psycopg
+
+          with psycopg.connect(os.environ["TEST_PGVECTOR_URL"]) as conn:
+              conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+              conn.commit()
+          print("vector extension ready")
+          PY
+
+      - name: Run the live pgvector suite
+        # pg_available raises rather than skipping when TEST_PGVECTOR_URL was
+        # set explicitly (which this job always does), so a service that's
+        # actually unreachable fails this step instead of the suite quietly
+        # reporting green having run nothing.
+        run: |
+          pytest tests/vector_store/test_pgvector_store.py -v -rs

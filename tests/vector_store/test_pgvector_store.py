@@ -10,7 +10,7 @@ To run these tests locally with Docker:
         -e POSTGRES_PASSWORD=postgres \
         -e POSTGRES_DB=test \
         -p 5432:5432 \
-        ankane/pgvector:latest
+        pgvector/pgvector:pg16
 
     pytest tests/vector_store/test_pgvector_store.py -v
 
@@ -63,29 +63,37 @@ TEST_CONNECTION_STRING = os.getenv(
 
 @pytest.fixture(scope="module")
 def pg_available() -> bool:
-    """Check if PostgreSQL with pgvector is available."""
+    """Check if PostgreSQL with pgvector is available.
+
+    A connection failure only means "skip" when TEST_PGVECTOR_URL wasn't set
+    explicitly, i.e. this is a local run falling back to the documented
+    default. CI sets it on purpose, so a failure there means the service is
+    genuinely broken and the suite should fail loudly instead of skipping.
+    """
     if not psycopg_available:
         return False
 
+    explicit_url = "TEST_PGVECTOR_URL" in os.environ
+
     try:
-        if psycopg_available:
-            try:
-                import psycopg
+        try:
+            import psycopg
 
-                conn = psycopg.connect(TEST_CONNECTION_STRING, connect_timeout=5)
-            except ImportError:
-                import psycopg2
+            conn = psycopg.connect(TEST_CONNECTION_STRING, connect_timeout=5)
+        except ImportError:
+            import psycopg2
 
-                conn = psycopg2.connect(TEST_CONNECTION_STRING, connect_timeout=5)
+            conn = psycopg2.connect(TEST_CONNECTION_STRING, connect_timeout=5)
 
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            cur.close()
-            conn.close()
-            return True
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        return True
     except Exception:
+        if explicit_url:
+            raise
         return False
-    return False
 
 
 @pytest.fixture
@@ -191,7 +199,13 @@ class TestPgVectorStoreAdd:
         ids = store.add(vectors, metadata)
 
         assert len(ids) == 5
-        assert all(id.startswith("vec_") for id in ids)
+        assert len(set(ids)) == 5
+        # add() assigns uuid4 identifiers, not a "vec_" prefix
+        for vector_id in ids:
+            try:
+                uuid.UUID(vector_id)
+            except ValueError:
+                pytest.fail(f"{vector_id!r} is not a valid uuid4 id")
 
     def test_add_auto_generate_ids(self, store):
         """Test that IDs are auto-generated if not provided."""
@@ -290,38 +304,40 @@ class TestPgVectorStoreSearch:
         if not pg_available:
             pytest.skip("PostgreSQL not available")
 
-        from semantica.vector_store.pgvector_store import PgVectorStore
+        from semantica.vector_store.pgvector_store import PgVectorStore, psycopg_sql
 
+        # setup_vectors is autouse and seeds unique_table_name, and fixtures are
+        # cached per test, so this needs a table of its own to be empty at all.
+        empty_table = f"{unique_table_name}_empty"
         empty_store = PgVectorStore(
             connection_string=TEST_CONNECTION_STRING,
-            table_name=unique_table_name,
+            table_name=empty_table,
             dimension=128,
             distance_metric="cosine",
         )
 
-        query = np.random.rand(128).astype(np.float32)
-        results = empty_store.search(query, top_k=5)
-
-        assert len(results) == 0
-
-        # Cleanup: Drop test table after test completes
-        # Uses best-effort cleanup - failures are silently ignored since
-        # this is teardown of optional test resources
         try:
-            with empty_store._get_connection() as conn:
-                cur = conn.cursor()
-                from semantica.vector_store.pgvector_store import psycopg_sql
-                drop_sql = psycopg_sql.SQL("DROP TABLE IF EXISTS {}").format(
-                    psycopg_sql.Identifier(unique_table_name)
-                )
-                cur.execute(drop_sql)
-                conn.commit()
-                cur.close()
-            empty_store.close()
-        except Exception:
-            # Best-effort cleanup: PostgreSQL may be unavailable during teardown
-            # This is expected when tests are skipped or connection is lost
-            pass
+            query = np.random.rand(128).astype(np.float32)
+            results = empty_store.search(query, top_k=5)
+
+            assert len(results) == 0
+        finally:
+            try:
+                with empty_store._get_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        psycopg_sql.SQL("DROP TABLE IF EXISTS {}").format(
+                            psycopg_sql.Identifier(empty_table)
+                        )
+                    )
+                    conn.commit()
+                    cur.close()
+                empty_store.close()
+            except Exception:
+                # Best-effort cleanup: PostgreSQL may be unavailable during
+                # teardown. This is expected when tests are skipped or the
+                # connection is lost.
+                pass
 
 
 class TestPgVectorStoreGet:
