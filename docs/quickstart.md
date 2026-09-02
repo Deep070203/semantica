@@ -393,8 +393,9 @@ Install the GPU extras so embedding and ML inference run on CUDA:
 pip install semantica[gpu]
 ```
 
-Process documents in a loop rather than loading everything at once, and write to
-a persistent graph backend instead of the in-memory graph:
+Scan the directory for paths first (no file contents are read), then handle one
+document at a time and write to a persistent graph backend instead of the
+in-memory graph:
 
 ```python
 from semantica.ingest import FileIngestor
@@ -403,15 +404,16 @@ from semantica.semantic_extract import NERExtractor, RelationExtractor
 from semantica.graph_store import GraphStore
 from semantica.kg import GraphBuilder
 
-parser  = DocumentParser()
-ner     = NERExtractor(method="pattern")
-rel     = RelationExtractor(method="pattern")
-store   = GraphStore(backend="neo4j", uri="bolt://localhost:7687",
-                     user="neo4j", password="password")
-builder = GraphBuilder(merge_entities=True, graph_store=store)
+ingestor = FileIngestor()
+parser   = DocumentParser()
+ner      = NERExtractor(method="pattern")
+rel      = RelationExtractor(method="pattern")
+store    = GraphStore(backend="neo4j", uri="bolt://localhost:7687",
+                      user="neo4j", password="password")
+builder  = GraphBuilder(merge_entities=True, graph_store=store)
 
-for source in FileIngestor().ingest("data/reports/"):
-    text     = parser.parse(source.path)["text"]
+for info in ingestor.scan_directory("data/reports/", recursive=True):
+    text     = parser.parse(info["path"])["text"]   # one document loaded at a time
     entities = ner.extract(text)
     rels     = rel.extract(text, entities=entities)
     builder.build({"entities": entities, "relationships": rels})
