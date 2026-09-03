@@ -181,11 +181,11 @@ apt29_intel = context.retrieve(
 ```
 
 <Note>
-  `max_hops` on `retrieve()` only takes effect alongside `anchor_node` (or
-  `min_confidence_decay`): it bounds the proximity radius used for scoring and
-  drops results farther than `max_hops` from the anchor. It does **not** change
-  how far graph expansion reaches: that is fixed by `max_expansion_hops` on the
-  constructor.
+  `max_hops` on `retrieve()` only takes effect when `anchor_node` is set: it
+  bounds the proximity radius used for scoring and drops results farther than
+  `max_hops` from the anchor. Without an `anchor_node` it is ignored. It does
+  **not** change how far graph expansion reaches: that is fixed by
+  `max_expansion_hops` on the constructor.
 </Note>
 
 ## Getting a grounded LLM answer with a reasoning path
@@ -474,7 +474,8 @@ compliance_context = AgentContext(
     retention_days=2555,   # 7-year regulatory retention
 )
 
-# In production these come from FileIngestor().ingest_file(); shown as strings here for brevity
+# In production the text comes from a parsed file, e.g. FileIngestor().ingest_file(path).text;
+# inline strings here for brevity
 basel_cre20_text = (
     "CRE20.32: For income-producing real estate where repayment depends on "
     "property cash flows, RWA = exposure × risk weight, where risk weight "
