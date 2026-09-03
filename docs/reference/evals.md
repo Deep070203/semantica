@@ -218,7 +218,7 @@ straightforward to serialize for logging or regression tracking.
 
 ## See also
 
-- [Decision Intelligence](../guides/decision-intelligence) — producing the `Decision` records this module scores
-- [Reasoning](reasoning) — inference output that reasoning-text evaluators can measure
-- [Policy Engine](../guides/policy-engine) — the `policy_engine` used by `decision_scores`
-- [Ontology Evaluator](ontology) — separate tooling for ontology quality metrics
+- [Decision Intelligence](/guides/decision-intelligence) — producing the `Decision` records this module scores
+- [Reasoning](/reference/reasoning) — inference output that reasoning-text evaluators can measure
+- [Policy Engine](/guides/policy-engine) — the `policy_engine` used by `decision_scores`
+- [Ontology Evaluator](/reference/ontology) — separate tooling for ontology quality metrics
