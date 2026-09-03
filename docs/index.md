@@ -1,6 +1,6 @@
 ---
 title: "Semantica"
-description: "The Accountability and Context Layer for AI: Context Graphs · Decision Intelligence · Full Provenance"
+description: "The Context and Semantic Layer for AI in High-Stakes Domains: Context Graphs · Decision Intelligence · Full Provenance"
 ---
 
 ```bash
@@ -9,7 +9,7 @@ pip install semantica
 
 Most AI agents store embeddings, not meaning. They can't say why a fact was recalled, where it came from, or what led to a decision. In healthcare, finance, legal, and government, that lack of a traceable record blocks production deployment.
 
-Semantica is the context and accountability layer that sits beneath your existing agent framework. It doesn't replace LangChain or LlamaIndex; it makes their outputs traceable.
+Semantica is the context and semantic layer for AI in high-stakes domains, sitting beneath your existing agent framework. It doesn't replace LangChain or LlamaIndex; it makes their outputs traceable.
 
 
 ## What Most AI Stacks Are Missing
@@ -246,7 +246,7 @@ Semantica is used in domains where every decision must be explainable and every 
     - Knowledge graphs vs. vector stores: when to use each
     - What GraphRAG is and how Semantica implements it
     - How provenance and decision tracking work together
-    - The accountability layer architecture
+    - The context and semantic layer architecture
   </Step>
   <Step title="Go deep on any module">
     Every module has a dedicated [reference page](/reference/context) with:
