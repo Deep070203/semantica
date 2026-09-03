@@ -66,8 +66,11 @@ registered under a stable name. `list_evaluators()` returns the current set:
 | `llm_as_judge` | caller-supplied `judge_fn(actual, expected)` returns truthy | `judge_fn` (required callable) |
 | `decision_scores` | all configured sub-checks on a `Decision` pass | see below |
 
-An evaluator that cannot run (bad regex, missing bound, no `judge_fn`) returns an
-`EvalMetric` with an `"error"` key in `meta` rather than raising.
+An evaluator that cannot run (bad regex, unparseable datetime, no `judge_fn`) returns an
+`EvalMetric` with an `"error"` key in `meta` rather than raising. Evaluators that
+require numeric bounds (`numeric_range`, `length_range`) instead return a failing
+metric with a `"reason"` key when the bound is missing — they do not raise and do
+not set `"error"`.
 
 ### `decision_scores`
 
@@ -77,10 +80,10 @@ the fraction of checks that passed; `passed` is `True` only when all of them did
 
 | Sub-check | Controlled by |
 | :--- | :--- |
-| Outcome matches | `expected_outcome` in config, or the case's `expected` |
-| Confidence in range | `min_confidence` (default 0.0), `max_confidence` (default 1.0) |
+| Outcome matches | `expected_outcome` in config, or the case's `expected`; **skipped** when neither is set |
+| Confidence in range | `min_confidence` (default 0.0), `max_confidence` (default 1.0); always run |
 | `decision_maker`, `reasoning`, `scenario` non-empty | always run |
-| Provenance present in metadata | `provenance_key` (default `"provenance"`) |
+| Provenance present in metadata | `provenance_key` (default `"provenance"`); always run |
 | Policy compliance | `policy_engine` and `policy_id` both set; skipped otherwise |
 
 Passing `causal_chain_exists` in config raises `NotImplementedError`. That key is a
