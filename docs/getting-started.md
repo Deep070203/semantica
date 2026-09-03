@@ -144,7 +144,8 @@ icon: "rocket"
     context = AgentContext(
         vector_store=VectorStore(backend="faiss", dimension=768),
         knowledge_graph=ContextGraph(advanced_analytics=True),
-        graph_expansion=True,   # multi-hop traversal from seed nodes
+        graph_expansion=True,       # blend graph traversal into retrieval
+        max_expansion_hops=3,       # how far to walk from the seed nodes
     )
 
     # store() runs extraction and populates both the vector index and the graph
@@ -158,13 +159,13 @@ icon: "rocket"
         "What companies were founded by people who worked at Apple?",
         use_graph=True,
         expand_graph=True,
-        max_hops=3,
     )
     for r in results:
-        print(f"[{r['score']:.3f}]  {r['content'][:80]}")
+        print(f"[{r['score']:.3f}]  {r['content'][:70]}  (source: {r['source']})")
     ```
 
-    For a grounded natural-language answer with an auditable traversal, use
+    Each result carries `content`, `score`, `source`, and `metadata`. For a
+    grounded natural-language answer plus an auditable traversal, use
     `context.query_with_reasoning(query, llm_provider=...)` — it returns
     `response`, `reasoning_path`, `sources`, and `confidence`.
 
