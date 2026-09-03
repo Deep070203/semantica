@@ -40,16 +40,17 @@ Scanning text to find and classify real-world entities:
 ```python
 # "Apple Inc. was founded by Steve Jobs in 1976 in Cupertino."
 [
-    Entity(text="Apple Inc.", label="ORG",    confidence=0.98),
-    Entity(text="Steve Jobs", label="PERSON", confidence=0.99),
-    Entity(text="1976",       label="DATE",   confidence=0.95),
-    Entity(text="Cupertino",  label="GPE",    confidence=0.97),
+    Entity(text="Apple Inc.", label="ORG",    start_char=0,  end_char=10, confidence=0.98),
+    Entity(text="Steve Jobs", label="PERSON", start_char=25, end_char=35, confidence=0.99),
+    Entity(text="1976",       label="DATE",   start_char=39, end_char=43, confidence=0.95),
+    Entity(text="Cupertino",  label="GPE",    start_char=47, end_char=56, confidence=0.97),
 ]
 ```
 
 `NERExtractor(method=...).extract(text)` returns a list of `Entity` objects, each
-with a `label`, a `confidence` score, character offsets, and metadata recording
-the extraction method. Three methods are available:
+with a `label`, character offsets (`start_char` / `end_char`), a `confidence`
+score, and a `metadata` dict recording the extraction method. Three methods are
+available:
 
 | Method | Speed | Accuracy | Requirements |
 | :------ | :----- | :-------- | :------------ |
@@ -62,15 +63,19 @@ the extraction method. Three methods are available:
 Finding how entities connect to each other:
 
 ```python
+jobs  = Entity(text="Steve Jobs", label="PERSON", start_char=25, end_char=35)
+apple = Entity(text="Apple Inc.", label="ORG",    start_char=0,  end_char=10)
+
 [
-    Relation(subject=Entity("Steve Jobs"), predicate="founded",     object=Entity("Apple Inc."), confidence=0.92),
-    Relation(subject=Entity("Apple Inc."), predicate="located_in",  object=Entity("Cupertino"),  confidence=0.89),
+    Relation(subject=jobs,  predicate="founded",     object=apple, confidence=0.92),
+    Relation(subject=apple, predicate="located_in",  object=Entity(text="Cupertino", label="GPE", start_char=47, end_char=56), confidence=0.89),
 ]
 ```
 
 `RelationExtractor(method=...).extract(text, entities=entities)` returns a list of
-`Relation` objects: typed subject-predicate-object triples with confidence scores
-and source attribution. Extraction runs via pattern rules, ML models, or LLMs.
+`Relation` objects: typed subject-predicate-object triples (the endpoints are
+`Entity` objects) with confidence scores and source attribution. Extraction runs
+via pattern rules, ML models, or LLMs.
 
 
 ## Knowledge Graph vs. Vector Store
@@ -283,7 +288,7 @@ Inferred: Steve Jobs has a connection to Cupertino
     reasoner.add_rule("ancestor(X, Z) :- parent(X, Y), ancestor(Y, Z).")
 
     reasoner.derive_all()
-    results = reasoner.query("ancestor(alice, ?Z)")   # [{"Z": "bob"}, {"Z": "charlie"}]
+    results = reasoner.query("ancestor(alice, ?Z)")   # {"Z": "bob"} and {"Z": "charlie"}, order not guaranteed
     ```
   </Tab>
   <Tab title="Engine Comparison">
@@ -300,7 +305,10 @@ Inferred: Steve Jobs has a connection to Cupertino
   </Tab>
 </Tabs>
 
-The rule-based engines produce **explainable inference paths**: not black-box conclusions. Every derived fact includes the rules and premises that produced it. `GraphReasoner` additionally returns the graph facts its LLM answer was grounded in.
+`Reasoner.forward_chain()` returns `InferenceResult` objects that carry the rule
+applied (`rule_used`) and the premises it fired on, and `ExplanationGenerator`
+turns one into a step-by-step natural-language justification: reasoning here is
+**not** a black box.
 
 
 ## Temporal Intelligence
@@ -331,8 +339,8 @@ from semantica.kg import SimilarityCalculator
 
 calc = SimilarityCalculator(method="cosine")   # "cosine" | "euclidean" | "manhattan" | "correlation"
 
-# Pairwise similarity across a set of node embeddings: {(node_a, node_b): score}
-matrix = calc.pairwise_similarity({"apple": vec_apple, "google": vec_google, "nest": vec_nest})
+# Similarity for every unique pair of node embeddings: {(node_a, node_b): score}
+pairs = calc.pairwise_similarity({"apple": vec_apple, "google": vec_google, "nest": vec_nest})
 
 # Or rank a set of embeddings by closeness to one query vector
 nearest = calc.find_most_similar(embeddings, query_embedding, top_k=10)
@@ -382,15 +390,17 @@ Every fact in Semantica links back to:
 - The **reasoning steps** that produced any inferred fact
 
 <Note>
-  This is W3C PROV-O compliant lineage: suitable for regulated industries that require audit trails (HIPAA, SOX, GDPR, FDA 21 CFR Part 11). `RDFExporter` carries provenance through into Turtle, N-Triples, RDF/XML, and JSON-LD exports.
+  This is W3C PROV-O compliant lineage: suitable for regulated industries that require audit trails (HIPAA, SOX, GDPR, FDA 21 CFR Part 11). `ProvenanceManager.export_prov(format="turtle")` serialises the recorded lineage as PROV-O RDF.
 </Note>
 
 ```python
 from semantica.provenance import ProvenanceManager
 
-prov   = ProvenanceManager()
-record = prov.get_provenance("apple_inc")   # dict; use get_lineage() for the full chain
+prov = ProvenanceManager()
+prov.track_entity("apple_inc", source="report.pdf",
+                  metadata={"extractor": "NamedEntityRecognizer", "confidence": 0.98})
 
+record = prov.get_provenance("apple_inc")   # dict; use get_lineage() for the full chain
 print(record["source_document"])
 print(record["timestamp"])
 print(record["checksum"])
@@ -485,6 +495,7 @@ Semantica is designed for extension. Any component: ingestor, extractor, graph b
 
     ```python
     from semantica.kg import method_registry
+    from semantica.kg.methods import calculate_centrality
 
     def fast_centrality(graph, **kwargs):
         """Custom centrality implementation."""
@@ -493,8 +504,8 @@ Semantica is designed for extension. Any component: ingestor, extractor, graph b
     # register(task, name, func)
     method_registry.register("centrality", "fast_centrality", fast_centrality)
 
-    # method_registry.get(task, name) returns the callable; the built-in
-    # CentralityCalculator picks it up when you pass method="fast_centrality"
+    # The task wrappers consult method_registry, so the name is now selectable:
+    scores = calculate_centrality(kg, method="fast_centrality")
 
     print(method_registry.list_all("centrality"))   # {"centrality": ["fast_centrality", ...]}
     ```
