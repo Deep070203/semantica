@@ -79,11 +79,12 @@ parser = DocumentParser()
 parsed = parser.parse(sources[0].path)   # parse() takes a path string
 
 print(parsed["full_text"][:200])   # extracted text
-print(parsed["metadata"])          # source path plus format-specific keys
+print(parsed["metadata"])          # document properties (fields vary by format)
 ```
 
-`parse()` returns a `dict`. Every format provides `full_text` and `metadata`;
-PDF and DOCX inputs also include `pages` (and `tables` via `DoclingParser`).
+`parse()` returns a `dict`. `full_text` and `metadata` are present for every
+format; other keys depend on the parser (`pages` for PDF, `tables` and
+`paragraphs` for DOCX, `tables` for `DoclingParser`).
 
 <Tip>
   For PDFs with tables, charts, or multi-column layouts, use `DoclingParser` (`pip install semantica[parse-docling]`): it applies advanced layout analysis and returns structured table data alongside text.
