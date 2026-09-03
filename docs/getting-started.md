@@ -84,8 +84,8 @@ icon: "rocket"
     # 1. Ingest
     sources = FileIngestor().ingest("data/report.pdf")
 
-    # 2. Parse (parse() takes a path and returns a dict)
-    text = DocumentParser().parse(sources[0].path)["text"]
+    # 2. Parse (extract_text returns a plain string for any supported format)
+    text = DocumentParser().extract_text(sources[0].path)
 
     # 3. Extract (extractors take text, return Entity / Relation objects)
     ner           = NERExtractor(method="pattern")  # no API key needed
