@@ -658,9 +658,20 @@ class CausalChainAnalyzer:
         max_depth: int,
     ) -> List[Decision]:
         """Trace transaction-time causal chains against an in-memory ContextGraph."""
-        eligible_edges = []
+        from .context_graph import _CAUSAL_TRAVERSAL_TYPES
+
+        # Build the time-eligible causal adjacency once.  The traversal below
+        # used to scan ``eligible_edges`` for every visited decision, which is
+        # O(V*E) on a wide temporal graph.  The type set is the same union the
+        # other causal traversals accept, so aliases such as "causes" are not
+        # invisible here.
+        causal_neighbors: Dict[str, List[str]] = {}
         for edge in getattr(self.graph_store, "edges", []):
-            if edge.edge_type not in ["CAUSED", "INFLUENCED", "PRECEDENT_FOR"]:
+            edge_type = getattr(edge, "edge_type", None)
+            if (
+                not isinstance(edge_type, str)
+                or edge_type.upper() not in _CAUSAL_TRAVERSAL_TYPES
+            ):
                 continue
             recorded_at = (edge.metadata or {}).get("recorded_at")
             if recorded_at is None:
@@ -669,10 +680,14 @@ class CausalChainAnalyzer:
                 edge_recorded_at = self._normalize_at_time(recorded_at)
             except ValueError:
                 continue
-            if edge_recorded_at <= cutoff:
-                eligible_edges.append(edge)
+            if edge_recorded_at > cutoff:
+                continue
+            if direction == "upstream":
+                causal_neighbors.setdefault(edge.target_id, []).append(edge.source_id)
+            else:
+                causal_neighbors.setdefault(edge.source_id, []).append(edge.target_id)
 
-        if not eligible_edges:
+        if not causal_neighbors:
             return []
 
         visited = set()
@@ -704,11 +719,9 @@ class CausalChainAnalyzer:
                     decision.metadata["causal_distance"] = depth
                     decisions.append(decision)
 
-            for edge in eligible_edges:
-                if direction == "upstream" and edge.target_id == current_id and depth < max_depth:
-                    queue.append((edge.source_id, depth + 1))
-                if direction == "downstream" and edge.source_id == current_id and depth < max_depth:
-                    queue.append((edge.target_id, depth + 1))
+            for next_id in causal_neighbors.get(current_id, ()):
+                if depth < max_depth:
+                    queue.append((next_id, depth + 1))
 
         if direction == "upstream":
             decisions.sort(key=lambda d: d.metadata.get("causal_distance", 0), reverse=True)
