@@ -54,7 +54,7 @@ class TestContextGraphDecisionEvaluatorsRepro:
         assert "eval_details" in node.properties, f"eval_details missing from node properties: {node.properties}"
         assert "cross_system_context" in node.properties
 
-    def test_record_decision_evaluator_failure_non_blocking(self, mock_vector_store):
+    def test_record_decision_evaluator_failure_non_blocking(self, mock_vector_store, caplog):
         """Failing evaluator must not prevent decision persistence."""
         graph = ContextGraph()
 
@@ -81,6 +81,7 @@ class TestContextGraphDecisionEvaluatorsRepro:
         node = graph.nodes[decision_id]
         assert "eval_score" in node.properties
         assert node.properties["eval_passed"] is False
+        assert "Evaluator execution crash" in caplog.text
 
     def test_record_decision_without_evaluators_unchanged(self, mock_vector_store):
         """Omission of evaluators preserves existing behavior."""

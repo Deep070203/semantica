@@ -80,7 +80,7 @@ from .agent_memory import AgentMemory
 from .context_retriever import ContextRetriever, RetrievedContext
 from .entity_linker import EntityLinker
 from .decision_models import Decision
-from .decision_recorder import DecisionRecorder
+from .decision_recorder import DecisionRecorder, execute_decision_evaluators
 from .decision_query import DecisionQuery
 from .causal_analyzer import CausalChainAnalyzer
 from .policy_engine import PolicyEngine
@@ -134,6 +134,8 @@ class AgentContext:
         advanced_analytics: bool = True,
         kg_algorithms: bool = True,
         vector_store_features: bool = True,
+        evaluators: Optional[List[Any]] = None,
+        eval_config: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         """
@@ -171,6 +173,9 @@ class AgentContext:
         self._checkpoints: Dict[str, Dict[str, Any]] = {}
         self._temporal_version_manager = kwargs.get("temporal_version_manager")
         
+        self.evaluators = evaluators if evaluators is not None else kwargs.get("evaluators")
+        self.eval_config = eval_config if eval_config is not None else kwargs.get("eval_config", {})
+        
         # Store advanced feature flags
         self.config = {
             "decision_tracking": decision_tracking,
@@ -180,6 +185,8 @@ class AgentContext:
             "graph_expansion": graph_expansion,
             "max_expansion_hops": max_expansion_hops,
             "hybrid_alpha": hybrid_alpha,
+            "evaluators": self.evaluators,
+            "eval_config": self.eval_config,
             **kwargs
         }
 
@@ -230,7 +237,11 @@ class AgentContext:
             if hasattr(knowledge_graph, "execute_query"):
                 self._decision_backend = "graph_store"
                 try:
-                    self._decision_recorder = DecisionRecorder(knowledge_graph)
+                    self._decision_recorder = DecisionRecorder(
+                        knowledge_graph,
+                        evaluators=self.evaluators,
+                        eval_config=self.eval_config,
+                    )
                     self._decision_query = DecisionQuery(
                         graph_store=knowledge_graph,
                         vector_store=vector_store if vector_store_features else None,
@@ -246,7 +257,11 @@ class AgentContext:
                     self.logger.warning(
                         f"Failed to initialize enhanced decision tracking ({type(e).__name__})"
                     )
-                    self._decision_recorder = DecisionRecorder(knowledge_graph)
+                    self._decision_recorder = DecisionRecorder(
+                        knowledge_graph,
+                        evaluators=self.evaluators,
+                        eval_config=self.eval_config,
+                    )
                     self._decision_query = DecisionQuery(knowledge_graph)
                     self._causal_analyzer = CausalChainAnalyzer(knowledge_graph)
                     self._policy_engine = PolicyEngine(knowledge_graph)
@@ -1683,6 +1698,18 @@ class AgentContext:
         from .decision_models import Decision
         import uuid
         
+        decision_metadata: Dict[str, Any] = {}
+        if cross_system_context:
+            decision_metadata["cross_system_context"] = cross_system_context
+        decision_metadata.setdefault(
+            "provenance",
+            {
+                "timestamp": datetime.now().isoformat(),
+                "decision_maker": decision_maker or "ai_agent",
+                "source": "agent_context",
+            }
+        )
+
         decision = Decision(
             decision_id=str(uuid.uuid4()),
             category=category,
@@ -1694,6 +1721,7 @@ class AgentContext:
             decision_maker=decision_maker or "ai_agent",
             valid_from=valid_from,
             valid_until=valid_until,
+            metadata=decision_metadata,
         )
         
         entities = entities or []
@@ -1714,6 +1742,20 @@ class AgentContext:
         if not hasattr(self.knowledge_graph, "record_decision"):
             raise RuntimeError("Decision tracking backend does not support decisions")
 
+        # Evaluate decision if evaluators are configured
+        eval_metadata = {}
+        if self.evaluators:
+            eval_results = execute_decision_evaluators(
+                decision, self.evaluators, self.eval_config, logger=self.logger
+            )
+            if eval_results:
+                eval_metadata.update(eval_results)
+
+        graph_metadata = {}
+        if cross_system_context:
+            graph_metadata["cross_system_context"] = cross_system_context
+        graph_metadata.update(eval_metadata)
+
         # Delegate to ContextGraph
         decision_id = self.knowledge_graph.record_decision(
             category=category,
@@ -1725,8 +1767,13 @@ class AgentContext:
             decision_maker=decision_maker,
             valid_from=valid_from,
             valid_until=valid_until,
-            metadata={"cross_system_context": cross_system_context} if cross_system_context else None
+            metadata=graph_metadata if graph_metadata else None
         )
+
+        if eval_metadata and hasattr(self.knowledge_graph, "nodes") and decision_id in self.knowledge_graph.nodes:
+            node = self.knowledge_graph.nodes[decision_id]
+            if hasattr(node, "properties") and isinstance(node.properties, dict):
+                node.properties.update(eval_metadata)
         
         return decision_id
 

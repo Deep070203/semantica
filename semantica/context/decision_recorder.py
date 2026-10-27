@@ -85,6 +85,98 @@ from .decision_models import (
 from .context_graph import ContextGraph
 
 
+def execute_decision_evaluators(
+    decision: Decision,
+    evaluators: Optional[List[Any]],
+    eval_config: Optional[Dict[str, Any]] = None,
+    logger: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Execute decision evaluators and aggregate results into eval metadata.
+
+    Args:
+        decision: Decision object to evaluate
+        evaluators: List of evaluator names (str) or callables
+        eval_config: Optional dictionary mapping evaluator names to their configurations
+        logger: Optional logger for recording evaluator errors
+
+    Returns:
+        Dictionary with eval_score, eval_passed, eval_details or None if evaluators is empty
+    """
+    if not evaluators:
+        return None
+
+    if logger is None:
+        logger = get_logger(__name__)
+
+    scores: List[float] = []
+    passed_list: List[bool] = []
+    details: Dict[str, Any] = {}
+
+    for evaluator in evaluators:
+        if isinstance(evaluator, str):
+            eval_name = evaluator
+        elif hasattr(evaluator, "__name__"):
+            eval_name = evaluator.__name__
+        else:
+            eval_name = str(evaluator)
+
+        cfg = (eval_config or {}).get(eval_name, {}) if isinstance(eval_config, dict) else {}
+
+        try:
+            if isinstance(evaluator, str):
+                from semantica.evals.registry import get_evaluator
+                fn = get_evaluator(evaluator)
+            elif callable(evaluator):
+                fn = evaluator
+            else:
+                raise TypeError(f"Evaluator must be string name or callable, got {type(evaluator).__name__}")
+
+            try:
+                result = fn(decision, config=cfg)
+            except TypeError:
+                result = fn(decision)
+
+            if hasattr(result, "score") and hasattr(result, "passed"):
+                score = float(result.score)
+                passed = bool(result.passed)
+                meta = getattr(result, "meta", {})
+            elif isinstance(result, dict):
+                score = float(result.get("score", 1.0 if result.get("passed", True) else 0.0))
+                passed = bool(result.get("passed", True))
+                meta = result.get("details", result.get("meta", {}))
+            elif isinstance(result, bool):
+                score = 1.0 if result else 0.0
+                passed = result
+                meta = {}
+            elif isinstance(result, (int, float)):
+                score = float(result)
+                passed = score >= 1.0
+                meta = {}
+            else:
+                score = 1.0 if bool(result) else 0.0
+                passed = bool(result)
+                meta = {}
+
+            scores.append(score)
+            passed_list.append(passed)
+            details[eval_name] = meta
+        except Exception as exc:
+            logger.exception(f"Evaluator '{eval_name}' execution failed: {exc}")
+            scores.append(0.0)
+            passed_list.append(False)
+            details[eval_name] = {"error": str(exc)}
+
+    overall_score = (sum(scores) / len(scores)) if scores else 1.0
+    overall_passed = all(passed_list) if passed_list else True
+
+    return {
+        "eval_score": overall_score,
+        "eval_passed": overall_passed,
+        "eval_details": details,
+    }
+
+
 class DecisionRecorder:
     """
     Records decisions with full context, policy applications, and provenance.
@@ -97,7 +189,9 @@ class DecisionRecorder:
         self,
         graph_store: GraphStore,
         embedding_generator: Optional[EmbeddingGenerator] = None,
-        provenance_manager: Optional[ProvenanceManager] = None
+        provenance_manager: Optional[ProvenanceManager] = None,
+        evaluators: Optional[List[Any]] = None,
+        eval_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize DecisionRecorder.
@@ -106,17 +200,23 @@ class DecisionRecorder:
             graph_store: Graph database instance for storing decisions
             embedding_generator: Optional embedding generator for semantic embeddings
             provenance_manager: Optional provenance manager for W3C PROV-O tracking
+            evaluators: Optional list of evaluators
+            eval_config: Optional evaluator configuration dictionary
         """
         self.graph_store = graph_store
         self.embedding_generator = embedding_generator
         self.provenance_manager = provenance_manager
+        self.evaluators = evaluators
+        self.eval_config = eval_config or {}
         self.logger = get_logger(__name__)
     
     def record_decision(
         self,
         decision: Decision,
         entities: List[str],
-        source_documents: List[str]
+        source_documents: List[str],
+        evaluators: Optional[List[Any]] = None,
+        eval_config: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Record decision with full context.
@@ -125,6 +225,8 @@ class DecisionRecorder:
             decision: Decision object to record
             entities: List of entity IDs linked to this decision
             source_documents: List of source document identifiers
+            evaluators: Optional override list of evaluators
+            eval_config: Optional override evaluator configuration
             
         Returns:
             Decision ID
@@ -135,6 +237,18 @@ class DecisionRecorder:
                 decision.reasoning_embedding = self.embedding_generator.generate(
                     decision.reasoning
                 )
+            
+            # Execute evaluators if configured
+            active_evaluators = evaluators if evaluators is not None else self.evaluators
+            active_eval_config = eval_config if eval_config is not None else self.eval_config
+            if active_evaluators:
+                eval_results = execute_decision_evaluators(
+                    decision, active_evaluators, active_eval_config, logger=self.logger
+                )
+                if eval_results:
+                    if decision.metadata is None:
+                        decision.metadata = {}
+                    decision.metadata.update(eval_results)
             
             # Store decision in graph database
             self._store_decision_node(decision)

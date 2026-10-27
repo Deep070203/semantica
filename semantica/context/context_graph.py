@@ -4137,6 +4137,8 @@ class ContextGraph:
         metadata: Optional[Dict[str, Any]] = None,
         valid_from: Optional[Union[str, int, float, datetime]] = None,
         valid_until: Optional[Union[str, int, float, datetime]] = None,
+        evaluators: Optional[List[Any]] = None,
+        eval_config: Optional[Dict[str, Any]] = None,
         **kwargs
     ) -> str:
         """
@@ -4151,6 +4153,10 @@ class ContextGraph:
             entities: Related entities
             decision_maker: Who made the decision
             metadata: Additional metadata
+            valid_from: Optional valid from timestamp
+            valid_until: Optional valid until timestamp
+            evaluators: Optional list of evaluators
+            eval_config: Optional evaluator configuration dictionary
             **kwargs: Additional decision data
             
         Returns:
@@ -4208,7 +4214,7 @@ class ContextGraph:
                     raise ValueError("Metadata keys must be non-empty strings")
                 if len(key.strip()) > 100:
                     raise ValueError("Metadata keys must be 100 characters or less")
-                if len(str(value)) > 1000:
+                if key != "eval_details" and len(str(value)) > 1000:
                     raise ValueError("Metadata values must be 1000 characters or less")
         
         # Validate kwargs
@@ -4217,7 +4223,7 @@ class ContextGraph:
                 raise ValueError("Additional field names must be non-empty strings")
             if len(key.strip()) > 100:
                 raise ValueError("Additional field names must be 100 characters or less")
-            if len(str(value)) > 1000:
+            if key != "eval_details" and len(str(value)) > 1000:
                 raise ValueError("Additional field values must be 1000 characters or less")
         
         decision_id = str(uuid.uuid4())
@@ -4233,6 +4239,43 @@ class ContextGraph:
         decision_maker = decision_maker.strip() if decision_maker else None
         normalized_valid_from = _normalize_temporal_input(valid_from)
         normalized_valid_until = _normalize_temporal_input(valid_until)
+
+        # Execute evaluators if configured
+        active_evaluators = evaluators if evaluators is not None else self.config.get("evaluators")
+        active_eval_config = eval_config if eval_config is not None else self.config.get("eval_config")
+        if active_evaluators and (metadata is None or "eval_score" not in metadata):
+            from .decision_models import Decision
+            from .decision_recorder import execute_decision_evaluators
+            
+            d_meta = dict(metadata or {})
+            d_meta.setdefault(
+                "provenance",
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "decision_maker": decision_maker or "ai_agent",
+                    "source": "context_graph",
+                }
+            )
+            d_obj = Decision(
+                decision_id=decision_id,
+                category=category,
+                scenario=scenario,
+                reasoning=reasoning,
+                outcome=outcome,
+                confidence=confidence,
+                timestamp=datetime.fromtimestamp(timestamp),
+                decision_maker=decision_maker or "ai_agent",
+                valid_from=normalized_valid_from,
+                valid_until=normalized_valid_until,
+                metadata=d_meta,
+            )
+            eval_results = execute_decision_evaluators(
+                d_obj, active_evaluators, active_eval_config, logger=self.logger
+            )
+            if eval_results:
+                if metadata is None:
+                    metadata = {}
+                metadata.update(eval_results)
         
         # Create decision record
         decision = {
