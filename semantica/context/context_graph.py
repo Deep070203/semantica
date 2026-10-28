@@ -4214,7 +4214,7 @@ class ContextGraph:
                     raise ValueError("Metadata keys must be non-empty strings")
                 if len(key.strip()) > 100:
                     raise ValueError("Metadata keys must be 100 characters or less")
-                if key != "eval_details" and len(str(value)) > 1000:
+                if len(str(value)) > 1000:
                     raise ValueError("Metadata values must be 1000 characters or less")
         
         # Validate kwargs
@@ -4223,7 +4223,7 @@ class ContextGraph:
                 raise ValueError("Additional field names must be non-empty strings")
             if len(key.strip()) > 100:
                 raise ValueError("Additional field names must be 100 characters or less")
-            if key != "eval_details" and len(str(value)) > 1000:
+            if len(str(value)) > 1000:
                 raise ValueError("Additional field values must be 1000 characters or less")
         
         decision_id = str(uuid.uuid4())
@@ -4240,22 +4240,20 @@ class ContextGraph:
         normalized_valid_from = _normalize_temporal_input(valid_from)
         normalized_valid_until = _normalize_temporal_input(valid_until)
 
-        # Execute evaluators if configured
+        # Execute evaluators if configured and not already fully evaluated
         active_evaluators = evaluators if evaluators is not None else self.config.get("evaluators")
         active_eval_config = eval_config if eval_config is not None else self.config.get("eval_config")
-        if active_evaluators and (metadata is None or "eval_score" not in metadata):
+        has_full_eval = (
+            metadata is not None
+            and "eval_score" in metadata
+            and "eval_passed" in metadata
+            and "eval_details" in metadata
+        )
+        if active_evaluators and not has_full_eval:
             from .decision_models import Decision
             from .decision_recorder import execute_decision_evaluators
             
             d_meta = dict(metadata or {})
-            d_meta.setdefault(
-                "provenance",
-                {
-                    "timestamp": datetime.now().isoformat(),
-                    "decision_maker": decision_maker or "ai_agent",
-                    "source": "context_graph",
-                }
-            )
             d_obj = Decision(
                 decision_id=decision_id,
                 category=category,
@@ -4273,9 +4271,7 @@ class ContextGraph:
                 d_obj, active_evaluators, active_eval_config, logger=self.logger
             )
             if eval_results:
-                if metadata is None:
-                    metadata = {}
-                metadata.update(eval_results)
+                metadata = {**(metadata or {}), **eval_results}
         
         # Create decision record
         decision = {

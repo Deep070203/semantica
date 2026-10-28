@@ -83,6 +83,7 @@ from .decision_models import (
     Precedent, ApprovalChain
 )
 from .context_graph import ContextGraph
+import inspect
 
 
 def execute_decision_evaluators(
@@ -132,10 +133,31 @@ def execute_decision_evaluators(
             else:
                 raise TypeError(f"Evaluator must be string name or callable, got {type(evaluator).__name__}")
 
-            try:
-                result = fn(decision, config=cfg)
-            except TypeError:
-                result = fn(decision)
+            
+            sig = inspect.signature(fn)
+            params = sig.parameters
+            has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+            call_kwargs = {}
+            if "config" in params or has_var_kwargs:
+                call_kwargs["config"] = cfg
+
+            expected_val = cfg.get("expected", cfg.get("expected_outcome"))
+            if "expected" in params or has_var_kwargs:
+                if expected_val is not None or (
+                    "expected" in params and params["expected"].default == inspect.Parameter.empty
+                ):
+                    call_kwargs["expected"] = expected_val
+
+            target = decision
+            if "field" in cfg and hasattr(decision, cfg["field"]):
+                target = getattr(decision, cfg["field"])
+            elif "field" in cfg and isinstance(decision, dict) and cfg["field"] in decision:
+                target = decision[cfg["field"]]
+            elif hasattr(decision, "outcome") and eval_name in ("exact_match", "regex_match", "levenshtein", "rouge"):
+                target = decision.outcome
+
+            result = fn(target, **call_kwargs)
 
             if hasattr(result, "score") and hasattr(result, "passed"):
                 score = float(result.score)
@@ -238,6 +260,10 @@ class DecisionRecorder:
                     decision.reasoning
                 )
             
+            # Track provenance if manager is available before running evaluators
+            if self.provenance_manager:
+                self._track_decision_provenance(decision, source_documents)
+
             # Execute evaluators if configured
             active_evaluators = evaluators if evaluators is not None else self.evaluators
             active_eval_config = eval_config if eval_config is not None else self.eval_config
@@ -255,10 +281,6 @@ class DecisionRecorder:
             
             # Link to entities
             self.link_entities(decision.decision_id, entities)
-            
-            # Track provenance
-            if self.provenance_manager:
-                self._track_decision_provenance(decision, source_documents)
             
             self.logger.info(f"Recorded decision: {decision.decision_id} | Actor: {decision.decision_maker} | Timestamp: {decision.timestamp} | Outcome: {decision.outcome} | Category: {decision.category}")
             return decision.decision_id
@@ -709,7 +731,7 @@ class DecisionRecorder:
         
         try:
             # Track decision as entity
-            self.provenance_manager.track_entity(
+            entity_record = self.provenance_manager.track_entity(
                 entity_id=decision.decision_id,
                 entity_type="decision",
                 activity_id="decision_making_process",
@@ -719,7 +741,7 @@ class DecisionRecorder:
             )
             
             # Track decision-making activity
-            self.provenance_manager.track_activity(
+            activity_record = self.provenance_manager.track_activity(
                 activity_id=f"decision_{decision.decision_id}",
                 activity_type="decision_making",
                 agent_id=decision.decision_maker,
@@ -727,6 +749,19 @@ class DecisionRecorder:
                 started_at=decision.timestamp,
                 ended_at=decision.timestamp
             )
+
+            # Ensure Decision metadata contains the provenance record that evaluators check
+            if decision.metadata is None:
+                decision.metadata = {}
+            decision.metadata["provenance"] = {
+                "entity_id": decision.decision_id,
+                "activity_id": f"decision_{decision.decision_id}",
+                "agent_id": decision.decision_maker,
+                "timestamp": decision.timestamp.isoformat() if decision.timestamp else None,
+                "source_documents": source_documents,
+                "entity_record": entity_record,
+                "activity_record": activity_record,
+            }
             
         except Exception as e:
             self.logger.exception("Failed to track provenance")

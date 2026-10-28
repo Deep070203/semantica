@@ -1672,6 +1672,7 @@ class AgentContext:
         decision_maker: Optional[str] = "ai_agent",
         valid_from: Optional[Union[str, datetime]] = None,
         valid_until: Optional[Union[str, datetime]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Record decision (wrapper for DecisionRecorder).
@@ -1685,6 +1686,9 @@ class AgentContext:
             entities: Optional list of entity IDs
             cross_system_context: Optional cross-system context
             decision_maker: Decision maker identifier
+            valid_from: Optional valid from timestamp
+            valid_until: Optional valid until timestamp
+            metadata: Optional decision metadata
             
         Returns:
             Decision ID
@@ -1698,36 +1702,27 @@ class AgentContext:
         from .decision_models import Decision
         import uuid
         
-        decision_metadata: Dict[str, Any] = {}
+        decision_metadata: Dict[str, Any] = dict(metadata or {})
         if cross_system_context:
             decision_metadata["cross_system_context"] = cross_system_context
-        decision_metadata.setdefault(
-            "provenance",
-            {
-                "timestamp": datetime.now().isoformat(),
-                "decision_maker": decision_maker or "ai_agent",
-                "source": "agent_context",
-            }
-        )
 
-        decision = Decision(
-            decision_id=str(uuid.uuid4()),
-            category=category,
-            scenario=scenario,
-            reasoning=reasoning,
-            outcome=outcome,
-            confidence=confidence,
-            timestamp=datetime.now(),
-            decision_maker=decision_maker or "ai_agent",
-            valid_from=valid_from,
-            valid_until=valid_until,
-            metadata=decision_metadata,
-        )
-        
         entities = entities or []
         source_documents = []  # Could be enhanced to capture source docs
 
         if self._decision_backend == "graph_store":
+            decision = Decision(
+                decision_id=str(uuid.uuid4()),
+                category=category,
+                scenario=scenario,
+                reasoning=reasoning,
+                outcome=outcome,
+                confidence=confidence,
+                timestamp=datetime.now(),
+                decision_maker=decision_maker or "ai_agent",
+                valid_from=valid_from,
+                valid_until=valid_until,
+                metadata=decision_metadata,
+            )
             decision_id = self._decision_recorder.record_decision(
                 decision, entities, source_documents
             )
@@ -1742,21 +1737,11 @@ class AgentContext:
         if not hasattr(self.knowledge_graph, "record_decision"):
             raise RuntimeError("Decision tracking backend does not support decisions")
 
-        # Evaluate decision if evaluators are configured
-        eval_metadata = {}
-        if self.evaluators:
-            eval_results = execute_decision_evaluators(
-                decision, self.evaluators, self.eval_config, logger=self.logger
-            )
-            if eval_results:
-                eval_metadata.update(eval_results)
-
-        graph_metadata = {}
+        graph_metadata = dict(metadata or {})
         if cross_system_context:
             graph_metadata["cross_system_context"] = cross_system_context
-        graph_metadata.update(eval_metadata)
 
-        # Delegate to ContextGraph
+        # Delegate to ContextGraph with evaluators and eval_config
         decision_id = self.knowledge_graph.record_decision(
             category=category,
             scenario=scenario,
@@ -1767,14 +1752,11 @@ class AgentContext:
             decision_maker=decision_maker,
             valid_from=valid_from,
             valid_until=valid_until,
-            metadata=graph_metadata if graph_metadata else None
+            metadata=graph_metadata if graph_metadata else None,
+            evaluators=self.evaluators,
+            eval_config=self.eval_config,
         )
 
-        if eval_metadata and hasattr(self.knowledge_graph, "nodes") and decision_id in self.knowledge_graph.nodes:
-            node = self.knowledge_graph.nodes[decision_id]
-            if hasattr(node, "properties") and isinstance(node.properties, dict):
-                node.properties.update(eval_metadata)
-        
         return decision_id
 
     def find_precedents(
