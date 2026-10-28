@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Relationship filtering on a `ContextGraph` rescanned the edge list for every node pair** (fixes #1927)
+  - `edge_types_between` read every edge of a `ContextGraph` for each (node, neighbour) pair it classified, so `detect_communities_label_propagation` and `calculate_pagerank` with `relationship_types` were O(E^2): about 21 s each on a 6,000-edge graph. `build_edge_type_index` now indexes a `ContextGraph`'s edge list as well, and both callers build the index once per call (1.4 s and 0.09 s on the same graph). The per-pair answers are unchanged. New `tests/kg/test_context_graph_edge_type_index.py`
+
 - **TOML config files were silently ignored on Python 3.11+**
   - `GraphStoreConfig`, `TripletStoreConfig` and `VectorStoreConfig` loaded `.toml` files with the `tomli` backport, which Semantica never declared and which is usually absent on 3.11+. The `ImportError` was caught, logged and the file's settings dropped. With 3.11 as the floor, all four config classes (including `VisualizationConfig`, which had a two-level fallback) use the stdlib `tomllib`. New `tests/test_toml_config_loading.py`
 
