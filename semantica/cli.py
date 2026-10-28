@@ -827,6 +827,42 @@ def shell(ctx: click.Context) -> None:
             _warn(cli_ctx, f"Error: {exc}")
 
 
+def _plain_release(version: str) -> Optional[Tuple[int, ...]]:
+    """Parse a plain X.Y.Z release into a comparable tuple, or None.
+
+    Trailing zero components are dropped so 0.8 and 0.8.0 compare equal.
+    """
+    if not re.fullmatch(r"\d+(\.\d+)*", version):
+        return None
+    parts = [int(p) for p in version.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _compare_versions(a: str, b: str) -> Optional[int]:
+    """Compare two version strings: 1 if a > b, 0 if equal, -1 if a < b.
+
+    Uses PEP 440 ordering when packaging is installed. It is not a core
+    dependency (#1513), so without it only plain X.Y.Z releases are ordered.
+    Returns None when no ordering can be established (e.g. a missing release
+    tag), so callers never guess an update from string equality.
+    """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        ra, rb = _plain_release(a), _plain_release(b)
+        if ra is None or rb is None:
+            return 0 if a == b else None
+        return (ra > rb) - (ra < rb)
+
+    try:
+        va, vb = Version(a), Version(b)
+    except InvalidVersion:
+        return None
+    return (va > vb) - (va < vb)
+
+
 @main.command()
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
@@ -850,20 +886,36 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
         tag: str = data.get("tag_name", "unknown")
         body: str = data.get("body", "").strip()
         html_url: str = data.get("html_url", "")
-        latest = tag.lstrip("v")
+        latest = tag.removeprefix("v")
         current = __version__
+        order = _compare_versions(latest, current)
+        update_available = None if order is None else order > 0
 
         if _is_json(cli_ctx, local_json):
-            _jecho({"current": current, "latest": latest, "url": html_url, "notes": body})
+            _jecho({
+                "current": current,
+                "latest": latest,
+                "update_available": update_available,
+                "url": html_url,
+                "notes": body,
+            })
             return
 
-        up_to_date = latest == current
-        status = (
-            f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
-            if up_to_date
-            else f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
-                 f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
-        )
+        if order is None:
+            status = f"[{_DIM}]Could not compare {current} with release {tag}[/{_DIM}]"
+        elif order > 0:
+            status = (
+                f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
+                f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
+            )
+        elif order == 0:
+            status = f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
+        else:
+            # A dev or unreleased build sorts above the latest published release.
+            status = (
+                f"[{_SUCCESS}]You are ahead of the latest release "
+                f"({current} > {latest})[/{_SUCCESS}]"
+            )
         console.print(
             Panel(
                 Text.from_markup(
@@ -876,7 +928,7 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
                 padding=(1, 2),
             )
         )
-        if html_url and not up_to_date:
+        if html_url and update_available:
             console.print(f"  [{_DIM}]Full notes: {html_url}[/{_DIM}]")
 
     _run_with_error_handling(_action)

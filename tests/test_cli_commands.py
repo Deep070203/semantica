@@ -5253,3 +5253,137 @@ class TestOntologyAlignOutput:
         # pd.read_json(lines=True) must succeed — this is what the F2 bug broke.
         df = pd.read_json(out, lines=True)
         assert "alignments" in df.columns
+
+
+class _FakeUrlopenResponse:
+    """Minimal context-manager response for a stubbed urllib.request.urlopen."""
+
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def __enter__(self) -> "_FakeUrlopenResponse":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _stub_release(monkeypatch, tag_name: str) -> None:
+    """Make the changelog's GitHub release lookup return *tag_name*."""
+    import urllib.request
+
+    payload = json.dumps({"tag_name": tag_name, "body": "", "html_url": ""}).encode()
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **kw: _FakeUrlopenResponse(payload),
+    )
+
+
+class TestChangelogVersionTag:
+    """changelog must strip the "v" prefix, not a run of leading characters.
+
+    Regression for #1845: ``tag.lstrip("v")`` treats "v" as a character set, so
+    a tag like ``vv1.2.3`` lost both leading v's. ``removeprefix("v")`` strips
+    exactly one, which is the documented intent.
+    """
+
+    @pytest.mark.parametrize(
+        "tag_name,expected",
+        [
+            ("v1.2.3", "1.2.3"),
+            ("vv1.2.3", "v1.2.3"),
+            ("1.2.3", "1.2.3"),
+        ],
+    )
+    def test_changelog_json_latest_strips_one_v(
+        self, runner, monkeypatch, tag_name, expected
+    ):
+        _stub_release(monkeypatch, tag_name)
+        result = runner.invoke(cli_module.main, ["changelog", "--json"])
+        _ok(result)
+        assert json.loads(result.output)["latest"] == expected
+
+
+class TestChangelogUpdateCheck:
+    """changelog must order versions, not compare them as strings.
+
+    A build ahead of the latest release (e.g. 0.8.0 against a v0.7.0 tag) used
+    to be told "Update available: 0.8.0 → 0.7.0", recommending a downgrade.
+    """
+
+    @pytest.mark.parametrize(
+        "current,tag_name,expected",
+        [
+            ("0.7.0", "v0.8.0", True),
+            ("0.8.0", "v0.8.0", False),
+            ("0.8", "v0.8.0", False),
+            ("0.8.0", "v0.7.0", False),
+            ("0.8.0.dev1", "v0.7.0", False),
+            ("0.8.0rc1", "v0.8.0", True),
+            ("0.8.0", "unknown", None),
+        ],
+    )
+    def test_changelog_json_update_available(
+        self, runner, monkeypatch, current, tag_name, expected
+    ):
+        _stub_release(monkeypatch, tag_name)
+        monkeypatch.setattr(cli_module, "__version__", current)
+        result = runner.invoke(cli_module.main, ["changelog", "--json"])
+        _ok(result)
+        assert json.loads(result.output)["update_available"] is expected
+
+    @pytest.mark.parametrize(
+        "current,tag_name,shown,hidden",
+        [
+            ("0.7.0", "v0.8.0", "Update available", "ahead of the latest"),
+            ("0.8.0", "v0.8.0", "on the latest version", "Update available"),
+            ("0.8.0", "v0.7.0", "ahead of the latest", "Update available"),
+            ("0.8.0", "unknown", "Could not compare", "Update available"),
+        ],
+    )
+    def test_changelog_status_line(
+        self, runner, monkeypatch, current, tag_name, shown, hidden
+    ):
+        _stub_release(monkeypatch, tag_name)
+        monkeypatch.setattr(cli_module, "__version__", current)
+        result = runner.invoke(cli_module.main, ["changelog"])
+        _ok(result)
+        assert shown in result.output
+        assert hidden not in result.output
+
+
+class TestChangelogWithoutPackaging:
+    """packaging is not a core dependency (#1513), so a slim install may lack it.
+
+    The fallback must still order plain X.Y.Z releases and must never report
+    an update it cannot establish.
+    """
+
+    @pytest.mark.parametrize(
+        "current,tag_name,expected",
+        [
+            ("0.7.0", "v0.8.0", True),
+            ("0.8.0", "v0.7.0", False),
+            ("0.8", "v0.8.0", False),
+            ("0.10.0", "v0.9.0", False),
+            ("0.8.0.dev1", "v0.8.0.dev1", False),
+            ("0.8.0.dev1", "v0.7.0", None),
+            ("0.8.0", "unknown", None),
+        ],
+    )
+    def test_changelog_json_update_available_without_packaging(
+        self, runner, monkeypatch, current, tag_name, expected
+    ):
+        import sys
+
+        # A None entry makes ``from packaging.version import ...`` raise ImportError.
+        monkeypatch.setitem(sys.modules, "packaging.version", None)
+        _stub_release(monkeypatch, tag_name)
+        monkeypatch.setattr(cli_module, "__version__", current)
+        result = runner.invoke(cli_module.main, ["changelog", "--json"])
+        _ok(result)
+        assert json.loads(result.output)["update_available"] is expected
