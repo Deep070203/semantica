@@ -89,7 +89,7 @@ class _DeleteStore:
 
 
 class _NoDeleteStore:
-    """Backend shaped like FAISS/Milvus/Weaviate: no delete surface at all."""
+    """Backend shaped like FAISS: no delete surface at all."""
 
     backend = "faiss"
 
@@ -323,6 +323,138 @@ class TestVectorBackendShapes(unittest.TestCase):
         self.assertEqual(receipt.stores["vectors"]["status"], STATUS_NOT_CONFIGURED)
 
 
+class TestVectorsAreDeletedOnceNotTwice(unittest.TestCase):
+    """The vector leg owns embedding deletion (issue #1375).
+
+    ``delete_memory()`` cascades to the vector store on its own, so without
+    ``skip_vector=True`` the memory leg would re-attempt every vector id the
+    vector leg already deleted and reported on.
+    """
+
+    def test_memory_owned_vector_ids_are_deleted_exactly_once(self):
+        store = _MemoryVectorStore()
+        memory = AgentMemory(vector_store=store)
+        memory.store(
+            "note about customer-4471",
+            entities=[{"id": "customer-4471", "name": "customer-4471"}],
+            skip_graph=True,
+        )
+
+        receipt = ErasureCoordinator(memory=memory).erase_entity("customer-4471")
+
+        self.assertEqual(receipt.stores["memory"]["status"], STATUS_ERASED)
+        # One delete call: the vector leg's. delete_memory() must not add a
+        # second, per-item attempt against ids that are already gone.
+        self.assertEqual(len(store.deleted), 1)
+        flattened = [vid for call in store.deleted for vid in call]
+        self.assertEqual(len(flattened), len(set(flattened)))
+
+    def test_batch_delete_still_cascades_to_vectors_by_default(self):
+        """Callers other than the coordinator keep the old behavior."""
+        store = _MemoryVectorStore()
+        memory = AgentMemory(vector_store=store)
+        memory_id = memory.store("a note", skip_graph=True)
+
+        self.assertEqual(memory.batch_delete([memory_id]), 1)
+
+        self.assertEqual(len(store.deleted), 1)
+
+    def test_rejected_vector_deletion_does_not_suppress_the_cascade(self):
+        """Store identity is not coverage: a failed vector leg keeps the
+        memory-side cascade as the second (and only remaining) attempt."""
+        store = _MemoryVectorStore(result=False)
+        memory = AgentMemory(vector_store=store)
+        memory.store(
+            "note about customer-4471",
+            entities=[{"id": "customer-4471", "name": "customer-4471"}],
+            skip_graph=True,
+        )
+
+        receipt = ErasureCoordinator(memory=memory).erase_entity("customer-4471")
+
+        self.assertEqual(receipt.stores["vectors"]["status"], STATUS_FAILED)
+        self.assertFalse(receipt.complete)
+        self.assertEqual(receipt.stores["memory"]["status"], STATUS_ERASED)
+        # Two delete attempts: the vector leg's, then delete_memory()'s
+        # cascade -- which must NOT be skipped when the store rejected the
+        # first attempt.
+        self.assertEqual(len(store.deleted), 2)
+
+    def test_incomplete_enumeration_does_not_suppress_the_cascade(self):
+        """When memory-owned ids could not all be enumerated, the vector leg
+        did not cover them, so delete_memory()'s cascade must still run."""
+
+        class _MappingUnreadableMemory(AgentMemory):
+            def vector_ids_for(self, memory_id):
+                raise RuntimeError("mapping backend unavailable")
+
+        store = _MemoryVectorStore()
+        memory = _MappingUnreadableMemory(vector_store=store)
+        memory_id = memory.store(
+            "note about customer-4471",
+            entities=[{"id": "customer-4471", "name": "customer-4471"}],
+            skip_graph=True,
+        )
+        owned = list(memory._vector_ids[memory_id])
+
+        receipt = ErasureCoordinator(memory=memory).erase_entity("customer-4471")
+
+        # The vector leg only ever learned the entity-keyed id...
+        self.assertEqual(store.deleted[0], ["customer-4471"])
+        # ...so the cascade still deleted the ids it missed.
+        self.assertEqual(receipt.stores["memory"]["status"], STATUS_ERASED)
+        flattened = [vid for call in store.deleted for vid in call]
+        for vector_id in owned:
+            self.assertIn(vector_id, flattened)
+
+    def test_skipped_cascade_still_drops_vector_id_bookkeeping(self):
+        """batch_delete(skip_vector=True) deletes permanently, so the local
+        vector-id mapping must not survive it (it would otherwise persist
+        through save()/load())."""
+        store = _MemoryVectorStore()
+        memory = AgentMemory(vector_store=store)
+        memory.store(
+            "note about customer-4471",
+            entities=[{"id": "customer-4471", "name": "customer-4471"}],
+            skip_graph=True,
+        )
+
+        receipt = ErasureCoordinator(memory=memory).erase_entity("customer-4471")
+
+        self.assertEqual(receipt.stores["memory"]["status"], STATUS_ERASED)
+        self.assertEqual(len(store.deleted), 1)  # the skip actually happened
+        self.assertEqual(memory._vector_ids, {})
+
+    def test_a_batch_delete_without_the_keyword_still_erases_memory(self):
+        """Duck-typed memories predating skip_vector keep working: the
+        coordinator probes the signature and falls back to the plain call."""
+        store = _DeleteVectorsStore()
+
+        class _LegacyMemory:
+            def __init__(self):
+                self.vector_store = store
+                self.items = {"m-1": {"memory_id": "m-1", "entities": [{"id": "e1"}]}}
+
+            def find_by_entity(self, entity_id, limit=None):
+                return list(self.items.values())[:limit]
+
+            def vector_ids_for(self, memory_id):
+                return [f"vec-{memory_id}"]
+
+            def batch_delete(self, memory_ids):  # pre-skip_vector signature
+                removed = 0
+                for memory_id in memory_ids:
+                    if self.items.pop(memory_id, None) is not None:
+                        removed += 1
+                return removed
+
+        receipt = ErasureCoordinator(memory=_LegacyMemory()).erase_entity("e1")
+
+        self.assertEqual(receipt.stores["vectors"]["status"], STATUS_ERASED)
+        self.assertEqual(receipt.stores["memory"]["status"], STATUS_ERASED)
+        self.assertEqual(receipt.stores["memory"]["items"], 1)
+
+
 class TestPartialFailureIsAResultNotAnException(unittest.TestCase):
     def test_a_raising_vector_store_does_not_stop_the_remaining_legs(self):
         graph, memory = _graph(), _memory_with("customer-4471", 4)
@@ -398,6 +530,121 @@ class TestReceipt(unittest.TestCase):
         payload["stores"]["graph"]["status"] = "tampered"
 
         self.assertEqual(receipt.stores["graph"]["status"], STATUS_ERASED)
+
+    def test_to_dict_deep_copies_nested_store_results(self):
+        """A nested dict in a store result is not shared with the live receipt.
+
+        ``backend_result`` from a vector backend is a dict of its own, so a
+        shallow per-store copy leaves it referenced by both the payload and the
+        receipt -- sanitizing the payload for a user-facing response would
+        silently corrupt the audit record.
+        """
+        receipt = ErasureReceipt(
+            entity_id="customer-4471",
+            stores={
+                "vectors": {
+                    "status": STATUS_ERASED,
+                    "backend": "qdrant",
+                    "backend_result": {"status": "completed"},
+                },
+            },
+        )
+
+        payload = receipt.to_dict()
+        payload["stores"]["vectors"]["backend_result"]["status"] = "redacted"
+
+        self.assertEqual(
+            receipt.stores["vectors"]["backend_result"]["status"], "completed"
+        )
+
+    def test_to_dict_store_results_are_distinct_objects(self):
+        """The per-store dict and any nested dict in the payload must not be
+        the same objects as the ones in the live receipt.
+
+        A mutation test proves *isolation* only when the copy actually
+        happened; identity checks prove *that* a copy was made.
+        """
+        receipt = ErasureReceipt(
+            entity_id="customer-4471",
+            stores={
+                "vectors": {
+                    "status": STATUS_ERASED,
+                    "backend": "qdrant",
+                    # Realistic Qdrant-shaped backend_result with rendered enum
+                    "backend_result": {"status": "UpdateStatus.COMPLETED", "points": 1},
+                    "vector_ids": 2,
+                    "via": "delete_vectors",
+                },
+                "graph": {"status": STATUS_ERASED, "nodes": 1, "edges": 3},
+            },
+        )
+
+        payload = receipt.to_dict()
+
+        # The stores container itself is a new dict.
+        self.assertIsNot(payload["stores"], receipt.stores)
+
+        # Each per-store result dict is a new object.
+        self.assertIsNot(
+            payload["stores"]["vectors"], receipt.stores["vectors"]
+        )
+        self.assertIsNot(
+            payload["stores"]["graph"], receipt.stores["graph"]
+        )
+
+        # The nested backend_result dict is also a new object.
+        self.assertIsNot(
+            payload["stores"]["vectors"]["backend_result"],
+            receipt.stores["vectors"]["backend_result"],
+        )
+
+        # Values are equal (correct copy), not just distinct references.
+        self.assertEqual(
+            payload["stores"]["vectors"]["backend_result"],
+            {"status": "UpdateStatus.COMPLETED", "points": 1},
+        )
+        self.assertEqual(payload["stores"]["graph"], {"status": STATUS_ERASED, "nodes": 1, "edges": 3})
+
+    def test_to_dict_isolation_across_multiple_stores(self):
+        """Mutations to any store in the payload must not affect any other
+        store in either the payload or the live receipt.
+
+        This catches a hypothetical implementation that shares a single deep
+        copy across all stores rather than copying each independently.
+        """
+        receipt = ErasureReceipt(
+            entity_id="e1",
+            stores={
+                "vectors": {
+                    "status": STATUS_UNSUPPORTED,
+                    "backend": "faiss",
+                    "vector_ids": 1,
+                    "detail": "backend exposes no delete()",
+                },
+                "memory": {"status": STATUS_ERASED, "items": 4},
+                "graph": {
+                    "status": STATUS_ERASED,
+                    "nodes": 1,
+                    "edges": 2,
+                },
+            },
+        )
+
+        payload = receipt.to_dict()
+
+        # Mutate every store in the payload.
+        payload["stores"]["vectors"]["status"] = "tampered"
+        payload["stores"]["memory"]["items"] = 0
+        payload["stores"]["graph"]["nodes"] = 99
+
+        # None of the live receipt's stores are affected.
+        self.assertEqual(receipt.stores["vectors"]["status"], STATUS_UNSUPPORTED)
+        self.assertEqual(receipt.stores["memory"]["items"], 4)
+        self.assertEqual(receipt.stores["graph"]["nodes"], 1)
+
+        # The other stores in the payload are also unaffected (no aliasing).
+        self.assertEqual(payload["stores"]["memory"]["items"], 0)   # our mutation
+        self.assertEqual(receipt.stores["memory"]["items"], 4)       # unchanged
 
     def test_receipt_and_tombstone_agree_on_when_the_erasure_happened(self):
         graph = _graph()

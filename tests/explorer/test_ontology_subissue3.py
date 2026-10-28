@@ -13,9 +13,11 @@ pytest.importorskip("fastapi")
 
 from semantica.explorer.app import create_app  # noqa: E402
 from semantica.explorer.routes.ontology import (  # noqa: E402
+    _MAX_ANALYSIS_NODES,
     OntologyEntry,
     _convert_ontology_to_graph,
     _node_belongs_to_ontology,
+    _resolve_owning_ontology,
 )
 from semantica.explorer.session import GraphSession  # noqa: E402
 
@@ -155,6 +157,76 @@ def test_ontology_graph_returns_editable_schema_nodes_and_edges(client):
     )
 
 
+def test_ontology_graph_nodes_carry_entity_type_for_compact_and_full_iri_types(client):
+    graph = client.app.state.session.graph
+    full_iri_class = "http://example.org/onto-a#Organization"
+    full_iri_property = "http://example.org/onto-a#employs"
+    full_iri_ontology = "http://example.org/full-iri-onto"
+    unrecognized_external = "http://vocab.example/Widget"
+    graph.add_node(
+        full_iri_class,
+        node_type="http://www.w3.org/2002/07/owl#Class",
+        content="Organization",
+        scheme_uri="http://example.org/onto-a",
+    )
+    graph.add_node(
+        full_iri_property,
+        node_type="http://www.w3.org/2002/07/owl#ObjectProperty",
+        content="employs",
+        scheme_uri="http://example.org/onto-a",
+    )
+    graph.add_node(
+        full_iri_ontology,
+        node_type="http://www.w3.org/2002/07/owl#Ontology",
+        content="Full IRI Ontology",
+        scheme_uri="http://example.org/onto-a",
+    )
+    # An outward reference to a node whose type is outside the schema
+    # vocabulary. /graph reports the classifier's verdict verbatim; reading it
+    # as "external reference material" is the editor's job, not the wire's.
+    graph.add_node(unrecognized_external, node_type="ex:Widget", content="Widget")
+    graph.add_edge(full_iri_property, unrecognized_external, edge_type="rdfs:range")
+
+    response = client.get(
+        "/api/ontology/graph",
+        params={"uri": "http://example.org/onto-a"},
+    )
+
+    assert response.status_code == 200
+    entity_types = {node["id"]: node["entity_type"] for node in response.json()["nodes"]}
+    assert entity_types["http://example.org/onto-a"] == "ontology"
+    assert entity_types["http://example.org/onto-a#Person"] == "class"
+    assert entity_types[full_iri_class] == "class"
+    assert entity_types["http://example.org/onto-a#name"] == "property"
+    assert entity_types[full_iri_property] == "property"
+    assert entity_types[full_iri_ontology] == "ontology"
+    assert entity_types[unrecognized_external] == "unknown"
+
+
+def test_graph_and_entity_endpoints_agree_on_entity_type(client):
+    graph = client.app.state.session.graph
+    unrecognized_external = "http://vocab.example/Widget"
+    graph.add_node(unrecognized_external, node_type="ex:Widget", content="Widget")
+    graph.add_edge(
+        "http://example.org/onto-a#name", unrecognized_external, edge_type="rdfs:range"
+    )
+
+    graph_response = client.get(
+        "/api/ontology/graph", params={"uri": "http://example.org/onto-a"}
+    )
+    assert graph_response.status_code == 200
+    from_graph = {
+        node["id"]: node["entity_type"] for node in graph_response.json()["nodes"]
+    }
+
+    for uri in ("http://example.org/onto-a#Person", unrecognized_external):
+        # The fragment has to survive the request or the path resolves to the
+        # parent ontology and the comparison silently passes on the wrong node.
+        detail = client.get(f"/api/ontology/entity/{quote(uri, safe='')}")
+        assert detail.status_code == 200
+        assert from_graph[uri] == detail.json()["entity_type"]
+
+
 def test_ontology_graph_rejects_unregistered_namespace(client):
     response = client.get(
         "/api/ontology/graph",
@@ -258,6 +330,89 @@ def test_node_belongs_to_ontology_nested_namespace_matrix():
     assert _node_belongs_to_ontology(node(f"{child}/Term"), child, {parent, child})
 
 
+def test_entity_detail_reports_explicit_owner(client):
+    response = client.get(
+        f"/api/ontology/entity/{quote('http://example.org/onto-a#Person', safe='')}"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source_ontology"] == "http://example.org/onto-a"
+    assert payload["owning_ontology"] == "http://example.org/onto-a"
+
+
+def test_entity_detail_reports_namespace_owner_without_explicit_scheme(client):
+    graph = client.app.state.session.graph
+    minted_directly = "http://example.org/onto-a#Address"
+    graph.add_node(minted_directly, node_type="owl:Class", content="Address")
+
+    response = client.get(f"/api/ontology/entity/{quote(minted_directly, safe='')}")
+
+    assert response.status_code == 200
+    assert response.json()["owning_ontology"] == "http://example.org/onto-a"
+
+
+def test_entity_detail_reports_no_owner_for_unregistered_nested_namespace(client):
+    graph = client.app.state.session.graph
+    nested_term = "http://example.org/onto-a/nested#Term"
+    graph.add_node(nested_term, node_type="owl:Class", content="Nested Term")
+
+    response = client.get(f"/api/ontology/entity/{quote(nested_term, safe='')}")
+
+    assert response.status_code == 200
+    # onto-a must not claim a nested vocabulary its own /graph response
+    # excludes, or a deep link selects onto-a and then finds nothing to select.
+    assert response.json()["owning_ontology"] is None
+
+
+def test_entity_detail_reports_an_explicit_owner_outside_the_registry(client):
+    graph = client.app.state.session.graph
+    borrowed = "http://example.org/onto-a#Borrowed"
+    unregistered_owner = "http://unregistered.example/vocab"
+    # Sits directly in onto-a's namespace, so the namespace rule has an answer
+    # ready — the node's own scheme_uri still has to win, or /entity reports an
+    # owner that contradicts the node and the editor opens the wrong ontology.
+    graph.add_node(
+        borrowed,
+        node_type="owl:Class",
+        content="Borrowed",
+        scheme_uri=unregistered_owner,
+    )
+
+    response = client.get(f"/api/ontology/entity/{quote(borrowed, safe='')}")
+
+    assert response.status_code == 200
+    assert response.json()["owning_ontology"] == unregistered_owner
+
+
+def test_owner_resolution_agrees_with_graph_membership(client):
+    """_resolve_owning_ontology and _node_belongs_to_ontology must not diverge.
+
+    The two answer the same question from opposite directions, and /entity and
+    /graph each use one of them. If they disagree, a deep link opens an ontology
+    whose graph then excludes the entity it was opened for.
+    """
+    parent = "http://example.org/onto-a"
+    nested = "http://example.org/onto-a/nested"
+    known = {parent, nested}
+    cases = [
+        {"id": parent},
+        {"id": f"{parent}#Direct"},
+        {"id": f"{parent}/Direct"},
+        {"id": f"{nested}#Term"},
+        {"id": f"{parent}/unregistered#Term"},
+        {"id": "http://elsewhere.example/Thing"},
+        {"id": f"{parent}#Explicit", "properties": {"scheme_uri": nested}},
+    ]
+
+    for node in cases:
+        owner = _resolve_owning_ontology(node, known)
+        for candidate in known:
+            assert _node_belongs_to_ontology(node, candidate, known) == (
+                owner == candidate
+            ), f"{node['id']} vs {candidate}: owner={owner}"
+
+
 def test_load_fallback_import_without_declaration_is_editable(client):
     turtle = """
 @prefix ex: <http://data.example.org/people#> .
@@ -308,6 +463,66 @@ def test_ontology_graph_ignores_unrelated_data_when_enforcing_size_limit(client)
     assert "http://example.org/onto-a#Person" in {
         node["id"] for node in response.json()["nodes"]
     }
+
+
+def test_ontology_graph_rejects_oversized_core_and_stops_scanning(client, monkeypatch):
+    graph = client.app.state.session.graph
+    for index in range(5_001):
+        graph.add_node(
+            f"http://example.org/onto-a#Bulk{index:05d}",
+            node_type="owl:Class",
+            content="Bulk",
+            scheme_uri="http://example.org/onto-a",
+        )
+    for index in range(3_000):
+        graph.add_node(
+            f"urn:unrelated:{index}",
+            node_type="owl:Class",
+            content="Unrelated",
+            scheme_uri="http://example.org/onto-b",
+        )
+
+    streamed = 0
+    original_iter_nodes = GraphSession.iter_nodes
+
+    def counting_iter_nodes(self, node_type=None):
+        nonlocal streamed
+        for node in original_iter_nodes(self, node_type=node_type):
+            streamed += 1
+            yield node
+
+    monkeypatch.setattr(GraphSession, "iter_nodes", counting_iter_nodes)
+
+    response = client.get(
+        "/api/ontology/graph",
+        params={"uri": "http://example.org/onto-a"},
+    )
+
+    assert response.status_code == 413
+    assert str(_MAX_ANALYSIS_NODES) in response.json()["detail"]
+    # The graph holds 8,001 owl:Class nodes and onto-a's own sort first, so a
+    # scan that abandons at the cap sees far fewer than the whole type.
+    assert streamed < 6_000
+
+
+def test_ontology_graph_hydrates_external_edge_targets_in_sorted_order(client):
+    graph = client.app.state.session.graph
+    external = "http://external.example/Thing"
+    also_external = "http://external.example/Aardvark"
+    graph.add_node(external, node_type="owl:Class", content="External Thing")
+    graph.add_node(also_external, node_type="owl:Class", content="External Aardvark")
+    graph.add_edge("http://example.org/onto-a#name", external, edge_type="rdfs:range")
+    graph.add_edge("http://example.org/onto-a#name", also_external, edge_type="rdfs:range")
+
+    response = client.get(
+        "/api/ontology/graph",
+        params={"uri": "http://example.org/onto-a"},
+    )
+
+    assert response.status_code == 200
+    node_ids = [node["id"] for node in response.json()["nodes"]]
+    assert {external, also_external} <= set(node_ids)
+    assert node_ids == sorted(node_ids)
 
 
 def test_shacl_generate_and_shapes(client):
@@ -362,6 +577,9 @@ def test_shacl_validate_rejects_empty_turtle(client):
 
 
 def test_shacl_validate_detects_missing_required_property(client):
+    # Needs the optional shacl extra; skip rather than fail on a
+    # core install.
+    pytest.importorskip("pyshacl")
     graph = client.app.state.session.graph
     onto_uri = "http://example.org/onto-a"
     person_a = "http://example.org/onto-a#Person"
@@ -409,6 +627,9 @@ onto:PersonNameShape a sh:NodeShape ;
 
 
 def test_shacl_validate_surfaces_warning_severity_results(client):
+    # Needs the optional shacl extra; skip rather than fail on a
+    # core install.
+    pytest.importorskip("pyshacl")
     graph = client.app.state.session.graph
     onto_uri = "http://example.org/onto-a"
     person_a = "http://example.org/onto-a#Person"
@@ -735,6 +956,7 @@ onto:PersonShape a sh:NodeShape ;
         payload = response.json()
         assert payload["status"] == "error"
         assert "exceeds maximum allowed size" in payload["message"]
+        assert "SEMANTICA_MAX_SHACL_TURTLE_BYTES" in payload["message"]
 
 
 def test_validate_shacl_rejects_too_many_triples(client):
@@ -757,6 +979,7 @@ onto:PersonShape a sh:NodeShape ;
         payload = response.json()
         assert payload["status"] == "error"
         assert "exceeds maximum allowed limit" in payload["message"]
+        assert "SEMANTICA_MAX_SHACL_TRIPLES" in payload["message"]
 
 
 def test_validate_shacl_handles_timeout(client):
@@ -786,6 +1009,7 @@ onto:PersonShape a sh:NodeShape ;
         payload = response.json()
         assert payload["status"] == "error"
         assert "timed out" in payload["message"]
+        assert "SEMANTICA_MAX_SHACL_TIMEOUT" in payload["message"]
 
 
 def test_validate_shacl_returns_unavailable_for_truncated_graph(client):

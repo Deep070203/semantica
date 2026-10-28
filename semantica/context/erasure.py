@@ -14,11 +14,15 @@ not. It *composes* the existing public APIs; nothing in ``context_graph.py`` or
 ``agent_memory.py`` changes, and ``ContextGraph`` keeps its graph-scope
 contract.
 
-The property that matters is honest partial reporting. Three vector backends
-(FAISS, Milvus, Weaviate) expose no delete at all, so erasure is genuinely not
-completable on them today. The receipt says ``unsupported`` for those rather
-than reporting a success it did not achieve -- a receipt that reads
-"graph: erased, memory: 14 erased, vectors: unsupported on faiss" is
+The property that matters is honest partial reporting. FAISS Flat indices now
+expose ``delete_vectors`` backed by native ``remove_ids``, so erasure is
+completable on them.  FAISS IVF indices explicitly reject deletion because
+their internal labels are not compacted after ``remove_ids``, which would
+desynchronize search results from the ``vector_ids`` mapping.  HNSW does not
+implement ``remove_ids`` at all.  Both IVF and HNSW report ``unsupported``.
+Milvus and Weaviate are also fully supported. The receipt says ``unsupported``
+rather than reporting a success it did not achieve -- a receipt that reads
+"graph: erased, memory: 14 erased, vectors: unsupported on faiss/hnsw" is
 actionable; a bare ``True`` is a compliance liability.
 
 Example:
@@ -29,18 +33,20 @@ Example:
     ...     "customer-4471", reason="GDPR Art. 17 request #882"
     ... )
     >>> receipt.complete
-    False
+    True
     >>> receipt.stores["vectors"]["status"]
-    'unsupported'
+    'not_configured'
 """
 
+import contextlib
+import copy
 import inspect
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from ..utils.logging import get_logger
-from .context_graph import _normalize_temporal_input
+from .context_graph import normalize_temporal_input
 
 __all__ = [
     "ErasureCoordinator",
@@ -117,13 +123,21 @@ class ErasureReceipt:
         ]
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialize the receipt, deep-copying the per-store results."""
+        """Serialize the receipt, deep-copying the per-store results.
+
+        Each store result is copied recursively so the returned payload shares
+        no mutable objects with the live receipt: mutating
+        ``payload["stores"][name][...]`` (including nested dicts such as a
+        vector backend's ``backend_result``) cannot corrupt the audit record.
+        """
         return {
             "entity_id": self.entity_id,
             "reason": self.reason,
             "erased_at": self.erased_at,
             "complete": self.complete,
-            "stores": {name: dict(result) for name, result in self.stores.items()},
+            "stores": {
+                name: copy.deepcopy(result) for name, result in self.stores.items()
+            },
         }
 
 
@@ -138,7 +152,12 @@ class ErasureCoordinator:
         graph: A :class:`~semantica.context.ContextGraph` (or anything exposing
             ``purge_node``).
         memory: An :class:`~semantica.context.AgentMemory` (or anything
-            exposing ``find_by_entity`` and ``batch_delete``).
+            exposing ``find_by_entity`` and ``batch_delete``; when
+            ``batch_delete`` accepts a ``skip_vector`` keyword the coordinator
+            sets it once its vector leg has fully covered the memory-bound
+            store, or when the vector leg is disabled outright, and otherwise
+            calls ``batch_delete(memory_ids)`` and leaves the implementation's
+            own cascade running).
         vector_store: Vector store holding entity-keyed embeddings. Defaults to
             ``memory.vector_store`` when a memory is supplied, and stays
             overridable for deployments that bind a store the memory does not
@@ -253,10 +272,18 @@ class ErasureCoordinator:
         # embedding behind. Deleting those ids here instead puts them behind
         # the one leg that reports honestly. Collected before anything is
         # deleted, while the items still exist to be enumerated.
-        stores["vectors"] = self._erase_vectors(
-            entity_id, self._all_vector_ids(entity_id, vector_ids)
+        all_ids, enumerated = self._all_vector_ids(entity_id, vector_ids)
+        stores["vectors"] = self._erase_vectors(entity_id, all_ids)
+        # The memory leg may only suppress delete_memory()'s own vector
+        # cascade when the vector leg demonstrably covered it: every
+        # memory-owned id was enumerated AND the store accepted the delete.
+        # Store identity alone proves neither.
+        vector_leg_covered = (
+            enumerated and stores["vectors"].get("status") == STATUS_ERASED
         )
-        stores["memory"] = self._erase_memory(entity_id)
+        stores["memory"] = self._erase_memory(
+            entity_id, vector_leg_covered=vector_leg_covered
+        )
         stores["graph"] = self._erase_graph(entity_id, reason, erased_at)
 
         receipt = ErasureReceipt(
@@ -307,7 +334,7 @@ class ErasureCoordinator:
 
     def _all_vector_ids(
         self, entity_id: str, vector_ids: Optional[Sequence[str]]
-    ) -> List[str]:
+    ) -> Tuple[List[str], bool]:
         """Caller-supplied vector ids plus the ids owned by memory items.
 
         Best-effort by design: if memory cannot be enumerated here, the memory
@@ -318,10 +345,15 @@ class ErasureCoordinator:
         Collects vector IDs from ALL memory items before deletion. Must call
         find_by_entity with limit=None to get all items, since find_by_entity
         doesn't support offset/cursor and we cannot delete while collecting.
+
+        Returns:
+            ``(ids, complete)``, where ``complete`` is False when enumeration
+            raised part-way through -- the list may then be missing ids, so
+            the caller must not treat the vector leg as covering everything.
         """
         ids: List[str] = list(vector_ids) if vector_ids is not None else [entity_id]
         if self.memory is None:
-            return ids
+            return ids, True
 
         seen_vector_ids = set(ids)
         try:
@@ -346,7 +378,8 @@ class ErasureCoordinator:
                 entity_id,
                 exc,
             )
-        return ids
+            return ids, False
+        return ids, True
 
     def _erase_vectors(
         self, entity_id: str, vector_ids: Optional[Sequence[str]]
@@ -368,8 +401,9 @@ class ErasureCoordinator:
 
         method_name, target = _vector_delete_capability(self.vector_store)
         if method_name is None:
-            # FAISS, Milvus and Weaviate expose no delete at all; FAISS in
-            # particular cannot remove from a flat index without a rebuild.
+            # FAISS HNSW does not implement remove_ids and FAISS IVF
+            # does not compact labels after remove_ids.  Only Flat indices
+            # currently support deletion via this code path.
             self.logger.warning(
                 "Vector backend %r exposes no delete; %d vector id(s) for %r "
                 "were not erased",
@@ -388,7 +422,20 @@ class ErasureCoordinator:
             }
 
         try:
-            deleted = getattr(target, method_name)(ids)
+            # Backend deletion bypasses the facade's public deletion method.
+            # Share its operation guard through accepted-result mirror cleanup
+            # so reinsertion and persistence cannot overtake this erasure.
+            # Standalone stores without the guard retain their existing path.
+            operation_lock = getattr(self.vector_store, "_operation_lock", None)
+            with (
+                operation_lock
+                if operation_lock is not None
+                else contextlib.nullcontext()
+            ):
+                deleted = getattr(target, method_name)(ids)
+                accepted, detail = _interpret_delete_result(deleted)
+                if accepted:
+                    _drop_from_facade_mirror(self.vector_store, ids)
         except NotImplementedError as exc:
             # The VectorStore facade declares delete_vectors() unconditionally
             # and only fails on the call when its backend cannot delete.
@@ -420,7 +467,6 @@ class ErasureCoordinator:
                 "detail": f"{type(exc).__name__}: {exc}",
             }
 
-        accepted, detail = _interpret_delete_result(deleted)
         result: Dict[str, Any] = {
             "status": STATUS_ERASED if accepted else STATUS_FAILED,
             "backend": backend,
@@ -443,15 +489,35 @@ class ErasureCoordinator:
             result["detail"] = "store reported the ids were not deleted"
         return result
 
-    def _erase_memory(self, entity_id: str) -> Dict[str, Any]:
+    def _erase_memory(
+        self, entity_id: str, *, vector_leg_covered: bool = False
+    ) -> Dict[str, Any]:
         """Delete every memory item referencing the entity."""
         if self.memory is None:
             return {"status": STATUS_NOT_CONFIGURED}
 
-        deleted = 0
-        skip_vector = self._vector_leg_disabled and _accepts_skip_vector(
-            self.memory.batch_delete
+        # When the vector leg succeeded against the store memory itself holds
+        # -- the default binding -- it has already deleted (and reported on)
+        # every memory-owned embedding, so delete_memory()'s own best-effort
+        # cascade would only re-attempt ids that are already gone: a redundant
+        # round-trip per item, and spurious warnings on backends that flag
+        # missing ids. In every other case -- a separate coordinator store,
+        # its deletion rejected, or its enumeration incomplete -- that cascade
+        # is still the only cleanup memory's own store gets, so it must keep
+        # running. The one exception is an explicit vector_store=False, which
+        # means "no vector activity at all" (see the class docstring). A
+        # memory-like whose batch_delete predates the keyword keeps its old
+        # call and cascade.
+        vector_leg_owns_store = (
+            vector_leg_covered
+            and self.vector_store is not None
+            and self.vector_store is getattr(self.memory, "vector_store", None)
         )
+        skip_vector = (
+            self._vector_leg_disabled or vector_leg_owns_store
+        ) and _accepts_skip_vector(self.memory.batch_delete)
+
+        deleted = 0
         if self._vector_leg_disabled and not skip_vector:
             # The class docstring only requires find_by_entity/batch_delete; a
             # duck-typed adapter is not required to support skip_vector. Falling
@@ -593,7 +659,7 @@ def _normalize_timestamp(at: Optional[Union[str, int, float, datetime]]) -> str:
     default path gets one timestamp for both records instead of two ``now()``
     calls separated by the length of the cascade.
     """
-    return _normalize_temporal_input(
+    return normalize_temporal_input(
         at if at is not None else datetime.now(timezone.utc)
     )
 
@@ -613,7 +679,16 @@ def _accepts_skip_vector(batch_delete: Any) -> bool:
     duck-typed contract the class docstring promises (``find_by_entity`` and
     ``batch_delete`` only). Passing it to an adapter that doesn't accept it
     would raise ``TypeError`` and fail the whole memory leg, so this is
-    checked before ever passing the kwarg.
+    checked before ever passing the kwarg. Probed by signature rather than
+    try/except around the real call: a ``TypeError`` raised from *inside* an
+    implementation that does accept the keyword must surface as that leg's
+    failure, not trigger a second delete attempt.
+
+    Only a callable whose signature cannot be introspected at all gets the
+    conservative plain call; a ``(*args, **kwargs)`` signature (a
+    ``MagicMock``, a hand-rolled passthrough wrapper) counts as accepting
+    ``skip_vector`` even if the callee then drops the keyword; the only
+    consequence is the cascade the flag would have suppressed.
     """
     try:
         signature = inspect.signature(batch_delete)
@@ -711,6 +786,28 @@ def _vector_delete_capability(store: Any) -> Tuple[Optional[str], Any]:
         if callable(getattr(target, name, None)):
             return name, target
     return None, target
+
+
+def _drop_from_facade_mirror(store: Any, ids: Sequence[Any]) -> None:
+    """Remove erased ids from the ``VectorStore`` facade's in-process mirror.
+
+    The delete goes to the backend store directly (see
+    ``_vector_delete_capability``), which skips the mirror cleanup in
+    ``VectorStore.delete_vectors()``. Left alone, the facade keeps serving the
+    erased vectors and ``save()`` writes them back to disk (#1832).
+
+    The caller holds the facade's operation guard across backend deletion and
+    this cleanup. Acquire only the mirror lock here, preserving that order.
+    """
+    vectors = getattr(store, "vectors", None)
+    metadata = getattr(store, "metadata", None)
+    if not isinstance(vectors, dict) or not isinstance(metadata, dict):
+        return
+    lock = getattr(store, "_inmemory_lock", None)
+    with lock if lock is not None else contextlib.nullcontext():
+        for vector_id in ids:
+            vectors.pop(vector_id, None)
+            metadata.pop(vector_id, None)
 
 
 def _vector_backend_name(store: Any) -> str:

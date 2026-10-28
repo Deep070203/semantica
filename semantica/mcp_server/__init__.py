@@ -275,9 +275,76 @@ def _tool_get_causal_chain(args: dict) -> dict:
         from semantica.context.causal_analyzer import CausalChainAnalyzer
         analyzer = CausalChainAnalyzer(graph_store=graph)
         chain = analyzer.get_causal_chain(decision_id, direction=direction, max_depth=max_depth)
-        return {"chain": chain if isinstance(chain, list) else list(chain)}
+        # The analyzer returns Decision dataclasses, and tools/call json.dumps
+        # this result. serialize_decision applies the existing default=str
+        # policy, which also covers non-JSON values inside decision metadata.
+        from semantica.context.decision_models import serialize_decision
+        return {"chain": [json.loads(serialize_decision(d)) if hasattr(d, "to_dict") else d
+                          for d in chain]}
     except Exception as exc:
         return {"error": str(exc), "chain": []}
+
+
+def _drop_link_edges(graph, edges) -> None:
+    """Undo only the new causal edges, including the duplicate-detection index."""
+    try:
+        with graph._lock:
+            for edge in edges:
+                graph._drop_edge_from_indexes(edge)
+                graph._edge_index.pop(edge.edge_id, None)
+    except Exception:
+        log.exception("could not roll back link_decisions")
+
+
+def _tool_link_decisions(args: dict) -> dict:
+    """Create a typed causal relationship between two recorded decisions."""
+    source = str(args.get("source") or "").strip()
+    target = str(args.get("target") or "").strip()
+    relationship = str(args.get("relationship") or "").strip()
+    if not source or not target:
+        return {"error": "source and target are required"}
+    if not relationship:
+        return {"error": "relationship is required"}
+    graph = _get_graph()
+    # Keep the add, save and rollback together so only this call's edges are undone.
+    with graph._lock:
+        try:
+            edge_count = len(graph.edges)
+            added = graph.add_causal_relationship(source, target, relationship)
+            # The new edge lands at edge_count; a mutation callback can append more.
+            new_edges = graph.edges[edge_count : edge_count + 1]
+        except ValueError as exc:
+            return {"error": str(exc)}
+        except Exception as exc:
+            log.exception("link_decisions failed")
+            return {"error": str(exc)}
+
+        kg_path = os.environ.get("SEMANTICA_KG_PATH")
+        if added and kg_path:
+            if not _kg_load_ok:
+                _drop_link_edges(graph, new_edges)
+                return {
+                    "error": (
+                        "Persistence blocked: the configured SEMANTICA_KG_PATH "
+                        "could not be loaded at startup. Restart the server to retry."
+                    )
+                }
+            try:
+                graph.save_to_file(kg_path)
+            except Exception as save_exc:
+                _drop_link_edges(graph, new_edges)
+                log.exception(
+                    "save_to_file failed after link_decisions; mutation rolled back"
+                )
+                return {
+                    "error": f"Mutation rolled back: could not persist graph: {save_exc}"
+                }
+    return {
+        "source": source,
+        "target": target,
+        "relationship": relationship,
+        "linked": added,
+    }
 
 
 def _tool_add_entity(args: dict) -> dict:
@@ -380,6 +447,41 @@ def _tool_run_reasoning(args: dict) -> dict:
     return {"derived_facts": derived if isinstance(derived, list) else list(derived)}
 
 
+def _pagerank_rankings(result: object) -> list:
+    """Return the ranked ``(node, score)`` pairs of a PageRank result.
+
+    ``CentralityCalculator.calculate_pagerank`` returns
+    ``{"centrality": {node: score}, "rankings": [...]}`` rather than a flat
+    ``{node: score}`` mapping, and its rankings list is already ordered.
+    """
+    if not isinstance(result, dict):
+        return []
+    rankings = result.get("rankings")
+    if isinstance(rankings, list):
+        return rankings
+    scores = result.get("centrality")
+    if not isinstance(scores, dict):
+        return []
+    return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
+def _community_count(result: object) -> int:
+    """Return the number of communities in a ``detect_communities`` result.
+
+    ``CommunityDetector.detect_communities`` returns a wrapper dict
+    (``communities``, ``node_assignments``, ``modularity``, ``algorithm``), so
+    taking ``len()`` of the whole result gives the key count, which is 4 for
+    every graph and every algorithm. A bare list of groups is still accepted.
+    """
+    if isinstance(result, dict):
+        groups = result.get("communities")
+    elif isinstance(result, list):
+        groups = result
+    else:
+        return 0
+    return len(groups) if isinstance(groups, list) else 0
+
+
 def _tool_get_graph_analytics(args: dict) -> dict:
     """Compute graph analytics: centrality, community detection, metrics."""
     graph = _get_graph()
@@ -389,14 +491,13 @@ def _tool_get_graph_analytics(args: dict) -> dict:
         communities = CommunityDetector().detect_communities(graph)
         node_count = len(list(graph.find_nodes()))
         edge_count = getattr(graph, "edge_count", lambda: 0)()
+        if not hasattr(graph, "edge_count") and hasattr(graph, "stats"):
+            edge_count = graph.stats().get("edge_count", 0)
         return {
             "node_count": node_count,
             "edge_count": edge_count,
-            "top_nodes_by_pagerank": sorted(
-                centrality.items() if hasattr(centrality, "items") else [],
-                key=lambda x: x[1], reverse=True
-            )[:10],
-            "community_count": len(communities) if isinstance(communities, (list, dict)) else 0,
+            "top_nodes_by_pagerank": _pagerank_rankings(centrality)[:10],
+            "community_count": _community_count(communities),
         }
     except Exception as exc:
         return {"error": str(exc)}
@@ -681,17 +782,31 @@ TOOLS = [
     },
     {
         "name": "get_causal_chain",
-        "description": "Trace the causal chain upstream or downstream from a decision.",
+        "description": "Trace the causal chain upstream, downstream or both from a decision.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "decision_id": {"type": "string", "description": "Decision ID to trace"},
-                "direction":   {"type": "string", "enum": ["upstream", "downstream"], "description": "Trace direction"},
+                "direction":   {"type": "string", "enum": ["upstream", "downstream", "both"], "description": "Trace direction"},
                 "max_depth":   {"type": "integer", "description": "Max chain depth (default 5)"},
             },
             "required": ["decision_id"],
         },
         "_handler": _tool_get_causal_chain,
+    },
+    {
+        "name": "link_decisions",
+        "description": "Create a typed causal relationship between two recorded decisions (CAUSED, INFLUENCED, or PRECEDENT_FOR).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source":       {"type": "string", "description": "Source decision ID (the cause)"},
+                "target":       {"type": "string", "description": "Target decision ID (the effect)"},
+                "relationship": {"type": "string", "enum": ["CAUSED", "INFLUENCED", "PRECEDENT_FOR"], "description": "Causal relationship type"},
+            },
+            "required": ["source", "target", "relationship"],
+        },
+        "_handler": _tool_link_decisions,
     },
     {
         "name": "add_entity",

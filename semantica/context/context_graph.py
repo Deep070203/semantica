@@ -117,6 +117,7 @@ import stat
 import tempfile
 import threading
 import uuid
+from bisect import bisect_left
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -131,6 +132,12 @@ from ..utils.progress_tracker import get_progress_tracker
 from ..utils.skos import is_skos_hierarchy_edge, validate_skos_hierarchy
 from ._markdown_filesystem import find_filesystem_link
 from .entity_linker import EntityLinker
+from .markdown import (
+    MarkdownIdentityError,
+    MarkdownResourceNotFoundError,
+    MarkdownRevisionConflictError,
+    markdown_document_revision,
+)
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -241,6 +248,42 @@ def _normalize_temporal_input(value: Optional[Union[str, int, float, datetime]])
             raise ValueError(f"Temporal value {value!r} is not a valid ISO datetime string")
         return parsed.isoformat()
     raise ValueError("Temporal values must be datetime, epoch seconds, ISO strings, or None")
+
+
+def normalize_temporal_input(
+    value: Optional[Union[str, int, float, datetime]]
+) -> Optional[str]:
+    """Normalize a temporal value to a tz-naive UTC ISO-8601 string.
+
+    This is the public surface of the normalization logic used throughout
+    :class:`ContextGraph` for retraction, purge, and decision timestamps.
+    Exposing it lets sibling modules (e.g. :mod:`erasure`) share the same
+    normalization without importing the private ``_normalize_temporal_input``.
+
+    Args:
+        value: Any of the following:
+
+            * ``None`` — returned as-is (no timestamp).
+            * :class:`~datetime.datetime` — converted to UTC if tz-aware,
+              then serialized as a tz-naive ISO string
+              (e.g. ``"2026-01-01T07:00:00"``).
+            * :class:`int` or :class:`float` — interpreted as a POSIX epoch
+              seconds value, converted to UTC, serialized as above.
+            * :class:`str` — must be a valid ISO-8601 datetime string;
+              offset-aware values (including ``Z``) are converted to UTC
+              before serialization.  Year-only (``"2026"``) and date-only
+              (``"2026-01-15"``) shorthand forms are also accepted.
+
+    Returns:
+        A tz-naive UTC ISO-8601 string (e.g. ``"2026-01-01T12:00:00"``),
+        or ``None`` when *value* is ``None``.
+
+    Raises:
+        ValueError: If *value* is a string that cannot be parsed as an
+            ISO-8601 datetime, or if *value* is a type that is not
+            supported (e.g. a :class:`~datetime.date` object).
+    """
+    return _normalize_temporal_input(value)
 
 
 def _closing_valid_until(current: Optional[str], at_iso: str) -> str:
@@ -434,7 +477,14 @@ class ContextEdge:
         self.source_id = str(self.source_id)
         self.target_id = str(self.target_id)
         self.edge_type = str(self.edge_type or "related_to")
-        self.weight = _coerce_float(self.weight, default=1.0)
+        if isinstance(self.weight, dict):
+            if not isinstance(self.metadata, dict):
+                self.metadata = {}
+            dict_meta = dict(self.weight)
+            self.weight = _coerce_float(dict_meta.pop("weight", 1.0), default=1.0)
+            self.metadata = {**dict_meta, **self.metadata}
+        else:
+            self.weight = _coerce_float(self.weight, default=1.0)
         if not isinstance(self.metadata, dict):
             self.metadata = {}
         self.edge_id, self.family_id = _resolve_edge_identity(
@@ -605,7 +655,10 @@ class ContextGraph:
                 if self.config.get("community_detection", True):
                     self.kg_components["community_detector"] = CommunityDetector()
                 if self.config.get("node_embeddings", True):
-                    self.kg_components["node_embedder"] = NodeEmbedder()
+                    try:
+                        self.kg_components["node_embedder"] = NodeEmbedder()
+                    except ImportError as e:
+                        self.logger.warning(f"Node2Vec embeddings disabled: {e}")
                 self.kg_components["path_finder"] = PathFinder()
                 self.kg_components["similarity_calculator"] = SimilarityCalculator()
                 self.kg_components["connectivity_analyzer"] = ConnectivityAnalyzer()
@@ -1004,6 +1057,12 @@ class ContextGraph:
                         "weight": edge.weight,
                         "hop": next_hop,
                     }
+                    # Expose the merged node metadata so consumers such as
+                    # support-aware retrieval can validate annotations on
+                    # neighbor attachments instead of dropping them blindly.
+                    entry_metadata: Dict[str, Any] = dict(node.properties or {})
+                    entry_metadata.update(node.metadata or {})
+                    entry["metadata"] = entry_metadata
                     if include_distance_metadata:
                         entry["distance_band"] = classify_path_distance(next_hop)
                         entry["confidence_decay"] = next_decay
@@ -1131,6 +1190,9 @@ class ContextGraph:
             **properties: Additional properties. Use `valid_from` and `valid_until`
                 (ISO datetime strings) to define a temporal validity window.
         """
+        if isinstance(weight, dict):
+            properties = {**weight, **properties}
+            weight = properties.pop("weight", 1.0)
         valid_from = properties.pop("valid_from", None)
         valid_until = properties.pop("valid_until", None)
         explicit_edge_id = properties.pop("id", properties.pop("edge_id", None))
@@ -1166,6 +1228,157 @@ class ContextGraph:
                     valid_until=valid_until,
                 )
             )
+
+    def export_node_markdown(self, node_id: str) -> str:
+        """Return one existing node as canonical Markdown.
+
+        Args:
+            node_id: Stable identifier of the node to export.
+
+        Returns:
+            Canonical Markdown containing the node frontmatter and body.
+
+        Raises:
+            MarkdownResourceNotFoundError: If ``node_id`` does not exist.
+        """
+        with self._lock:
+            node = self.nodes.get(node_id)
+            if node is None:
+                raise MarkdownResourceNotFoundError(
+                    f"ContextGraph node {node_id!r} was not found."
+                )
+            return self._node_markdown_source(node)
+
+    def _node_markdown_source(self, node: ContextNode) -> str:
+        frontmatter = {
+            "id": node.node_id,
+            "type": node.node_type,
+            "properties": copy.deepcopy(node.properties),
+            "metadata": copy.deepcopy(node.metadata),
+            "valid_from": node.valid_from,
+            "valid_until": node.valid_until,
+        }
+        return self._render_markdown_document(
+            frontmatter, node.content, f"node {node.node_id!r}"
+        )
+
+    def apply_node_markdown(
+        self,
+        node_id: str,
+        document: str,
+        *,
+        expected_revision: Optional[str] = None,
+    ) -> bool:
+        """Validate and atomically replace one existing node.
+
+        Args:
+            node_id: Stable identifier of the node to update.
+            document: Canonical Markdown containing the replacement node.
+            expected_revision: Optional revision returned by
+                :meth:`export_node_markdown`. A mismatch rejects stale edits.
+
+        Returns:
+            ``True`` when the node changed, otherwise ``False``.
+
+        Raises:
+            ValueError: If the Markdown or frontmatter is invalid.
+            MarkdownIdentityError: If the frontmatter changes the node ID.
+            MarkdownResourceNotFoundError: If ``node_id`` does not exist.
+            MarkdownRevisionConflictError: If ``expected_revision`` is stale.
+        """
+        source = f"node {node_id!r}"
+        frontmatter, body = self._parse_markdown_document(document, source)
+        candidate = self._parse_markdown_node(frontmatter, body, source)
+        if candidate.node_id != node_id:
+            raise MarkdownIdentityError(
+                f"Frontmatter id {candidate.node_id!r} does not match resource id "
+                f"{node_id!r}."
+            )
+
+        with self._lock:
+            existing = self.nodes.get(node_id)
+            if existing is None:
+                raise MarkdownResourceNotFoundError(
+                    f"ContextGraph node {node_id!r} was not found."
+                )
+            if expected_revision is not None:
+                current_revision = markdown_document_revision(
+                    self._node_markdown_source(existing)
+                )
+                if current_revision != expected_revision:
+                    raise MarkdownRevisionConflictError(current_revision)
+            if existing == candidate:
+                return False
+
+            # Decision index rebuilding can still reject YAML-valid property
+            # shapes, so retain every affected structure until commit succeeds.
+            decision_state_before = {}
+            if (
+                existing.node_type.lower() == "decision"
+                or candidate.node_type.lower() == "decision"
+            ):
+                for attribute in (
+                    "_decisions",
+                    "_decision_index",
+                    "_entity_index",
+                    "_temporal_index",
+                ):
+                    if not hasattr(self, attribute):
+                        decision_state_before[attribute] = None
+                    elif attribute in {"_decision_index", "_entity_index"}:
+                        decision_state_before[attribute] = {
+                            key: set(values)
+                            for key, values in getattr(self, attribute).items()
+                        }
+                    elif attribute == "_temporal_index":
+                        decision_state_before[attribute] = list(
+                            getattr(self, attribute)
+                        )
+                    else:
+                        decision_state_before[attribute] = dict(
+                            getattr(self, attribute)
+                        )
+
+            old_type = existing.node_type
+            try:
+                old_bucket = self.node_type_index.get(old_type)
+                if old_bucket is not None:
+                    old_bucket.discard(node_id)
+                    if not old_bucket:
+                        del self.node_type_index[old_type]
+
+                self.nodes[node_id] = candidate
+                self.node_type_index[candidate.node_type].add(node_id)
+                if (
+                    old_type.lower() == "decision"
+                    or candidate.node_type.lower() == "decision"
+                ):
+                    self._sync_decision_from_node(node_id)
+                payload = candidate.to_dict()
+                self._analytics_cache.clear()
+            except Exception:
+                self.nodes[node_id] = existing
+                candidate_bucket = self.node_type_index.get(candidate.node_type)
+                if candidate_bucket is not None:
+                    candidate_bucket.discard(node_id)
+                    if not candidate_bucket:
+                        del self.node_type_index[candidate.node_type]
+                self.node_type_index[old_type].add(node_id)
+                for attribute, state in decision_state_before.items():
+                    if state is None:
+                        if hasattr(self, attribute):
+                            delattr(self, attribute)
+                    else:
+                        restored = (
+                            defaultdict(set, state)
+                            if attribute in {"_decision_index", "_entity_index"}
+                            else state
+                        )
+                        setattr(self, attribute, restored)
+                raise
+
+        self._emit_mutation("UPDATE_NODE", node_id, payload)
+        return True
 
     def save_to_file(
         self, path: Union[str, Path], format: str = "json"
@@ -2933,8 +3146,12 @@ class ContextGraph:
                 self.logger.warning(f"Audit trail callback failed for node {node.node_id}: {e}")
         return True
     
-    def _add_internal_edge(self, edge: ContextEdge) -> bool:
-        """Internal method to add an edge."""
+    def _add_internal_edge(self, edge: ContextEdge, unique_type: bool = False) -> bool:
+        """Internal method to add an edge.
+
+        With ``unique_type=True`` the edge is skipped when the source already has
+        an edge of the same type to the same target.
+        """
         if edge.source_id is None or edge.target_id is None:
             self.logger.warning("Skipping internal edge with invalid endpoints: %r", edge)
             return False
@@ -2942,6 +3159,11 @@ class ContextGraph:
             # Edge identity is content-derived, so an existing edge_id means this
             # exact edge is already stored; re-adding it is a no-op (issue #922).
             if edge.edge_id in self._edge_index:
+                return False
+            if unique_type and any(
+                e.target_id == edge.target_id and e.edge_type == edge.edge_type
+                for e in self._adjacency.get(edge.source_id, [])
+            ):
                 return False
 
             # Ensure nodes exist
@@ -3652,15 +3874,42 @@ class ContextGraph:
         # Handle None metadata
         metadata = decision.metadata or {}
 
+        # Validate the values the decision indexes need before touching graph
+        # state, so a bad value can't leave a stored but unindexed node.
+        try:
+            hash(decision.category)
+            float(decision.confidence)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Decision {node_id!r} has an invalid category or confidence: {e}"
+            ) from e
+        meta_entities = metadata.get("entities")
+        if meta_entities is not None:
+            if not isinstance(meta_entities, list):
+                raise ValueError("Decision metadata 'entities' must be a list")
+            try:
+                for entity in meta_entities:
+                    hash(entity)
+            except TypeError as e:
+                raise ValueError(
+                    "Decision metadata 'entities' must contain hashable values"
+                ) from e
+
         # Normalize timestamp to ensure consistent storage format
-        normalized_timestamp = self._normalize_timestamp(decision.timestamp)
+        raw_timestamp = decision.timestamp
+        if isinstance(raw_timestamp, str) and raw_timestamp.strip().endswith(("Z", "z")):
+            raw_timestamp = raw_timestamp.strip()[:-1] + "+00:00"
+        normalized_timestamp = self._normalize_timestamp(raw_timestamp)
 
         node = ContextNode(
             node_id=node_id,
             node_type="Decision",
             content=decision.scenario,
             properties={
+                # Metadata first so it can't override the Decision's own fields.
+                **metadata,
                 "category": decision.category,
+                "scenario": decision.scenario,
                 "reasoning": decision.reasoning,
                 "outcome": decision.outcome,
                 "confidence": decision.confidence,
@@ -3668,12 +3917,15 @@ class ContextGraph:
                 "decision_maker": decision.decision_maker,
                 "reasoning_embedding": decision.reasoning_embedding,
                 "node2vec_embedding": decision.node2vec_embedding,
-                **metadata
             },
             valid_from=decision.valid_from,
             valid_until=decision.valid_until,
         )
-        self._add_internal_node(node)
+        with self._lock:
+            if self._add_internal_node(node):
+                # Register in the decision indexes so precedent search,
+                # influence, causality and insights can see this decision.
+                self._sync_decision_from_node(node_id)
         return node_id
 
     def add_causal_relationship(
@@ -3681,14 +3933,24 @@ class ContextGraph:
         source_decision_id: str,
         target_decision_id: str,
         relationship_type: str
-    ) -> None:
+    ) -> bool:
         """
         Add causal relationship between decisions.
-        
+
         Args:
             source_decision_id: Source decision ID
             target_decision_id: Target decision ID
             relationship_type: Type of relationship (CAUSED, INFLUENCED, PRECEDENT_FOR)
+
+        Returns:
+            True when a new causal edge was inserted.
+            False when the operation was skipped without inserting an edge:
+              - source or target decision ID is not present in the graph;
+              - source or target node exists but is not a decision node;
+              - an equivalent causal relationship (same source, target, and
+                normalized relationship type) already exists.
+            Skipped operations are logged at WARNING level. Invalid
+            relationship types raise ValueError instead of returning False.
         """
         # Normalize so callers may use either vocabulary's spelling
         # ("causes" from CausalChainAnalyzer, or "CAUSED" from this module's
@@ -3702,17 +3964,25 @@ class ContextGraph:
         
         # Check if decisions exist - if not, skip adding relationship
         if source_decision_id not in self.nodes or target_decision_id not in self.nodes:
-            return
-        
+            self.logger.warning(
+                "add_causal_relationship skipped: unknown decision id(s) "
+                f"'{source_decision_id}' -> '{target_decision_id}'"
+            )
+            return False
+
         # Check if nodes are decision nodes - if not, skip adding relationship
         source_node = self.nodes[source_decision_id]
         target_node = self.nodes[target_decision_id]
         if (not hasattr(source_node, 'node_type') or not isinstance(source_node.node_type, str) or
             not hasattr(target_node, 'node_type') or not isinstance(target_node.node_type, str) or
-            source_node.node_type.lower() != "decision" or 
+            source_node.node_type.lower() != "decision" or
             target_node.node_type.lower() != "decision"):
-            return
-        
+            self.logger.warning(
+                "add_causal_relationship skipped: nodes are not decision nodes "
+                f"('{source_decision_id}' -> '{target_decision_id}')"
+            )
+            return False
+
         edge = ContextEdge(
             source_id=source_decision_id,
             target_id=target_decision_id,
@@ -3720,7 +3990,17 @@ class ContextGraph:
             weight=1.0,
             metadata={"recorded_at": datetime.utcnow().isoformat()},
         )
-        self._add_internal_edge(edge)
+        # edge_id includes recorded_at, so the same causal link recorded twice
+        # gets a new id; compare (target, type) instead.
+        if not self._add_internal_edge(edge, unique_type=True):
+            self.logger.warning(
+                "Causal relationship %s -[%s]-> %s already exists; skipping",
+                source_decision_id,
+                relationship_type,
+                target_decision_id,
+            )
+            return False
+        return True
 
     def get_causal_chain(
         self,
@@ -3733,17 +4013,46 @@ class ContextGraph:
         
         Args:
             decision_id: Starting decision ID
-            direction: "upstream" or "downstream"
-            max_depth: Maximum traversal depth
-            
+            direction: "upstream", "downstream" or "both" (the upstream
+                chain followed by the downstream one, each decision listed
+                once and tagged with metadata["causal_direction"])
+            max_depth: Maximum traversal depth, per direction
+
         Returns:
             List of decisions in causal chain
         """
         from .decision_models import Decision
-        
+
+        if direction == "both":
+            chain, seen = [], set()
+            for side in ("upstream", "downstream"):
+                for d in self.get_causal_chain(decision_id, side, max_depth):
+                    if d.decision_id not in seen:
+                        seen.add(d.decision_id)
+                        d.metadata["causal_direction"] = side
+                        chain.append(d)
+            return chain
+
         if direction not in ["upstream", "downstream"]:
-            raise ValueError("Direction must be 'upstream' or 'downstream'")
-        
+            raise ValueError("Direction must be 'upstream', 'downstream' or 'both'")
+
+        # Build the causal adjacency once.  The traversal below used to loop
+        # over ``self.edges`` for every decision it dequeued, which is O(V*E)
+        # on a wide causal graph.  One pass over the edge list is enough, and
+        # keeps the per-node neighbour order identical to the old scan.
+        causal_neighbors: Dict[str, List[str]] = defaultdict(list)
+        for edge in self.edges:
+            edge_type = edge.edge_type
+            if (
+                not isinstance(edge_type, str)
+                or edge_type.upper() not in _CAUSAL_TRAVERSAL_TYPES
+            ):
+                continue
+            if direction == "upstream":
+                causal_neighbors[edge.target_id].append(edge.source_id)
+            else:
+                causal_neighbors[edge.source_id].append(edge.target_id)
+
         # BFS traversal
         visited = set()
         queue = deque([(decision_id, 0)])
@@ -3787,16 +4096,10 @@ class ContextGraph:
                         decision.metadata["causal_distance"] = depth
                         decisions.append(decision)
             
-            # Find connected decisions
-            for edge in self.edges:
-                if direction == "upstream":
-                    if edge.target_id == current_id and edge.edge_type.upper() in _CAUSAL_TRAVERSAL_TYPES:
-                        if edge.source_id not in visited and depth < max_depth:
-                            queue.append((edge.source_id, depth + 1))
-                else:  # downstream
-                    if edge.source_id == current_id and edge.edge_type.upper() in _CAUSAL_TRAVERSAL_TYPES:
-                        if edge.target_id not in visited and depth < max_depth:
-                            queue.append((edge.target_id, depth + 1))
+            # Find connected decisions from the adjacency built once above.
+            for next_id in causal_neighbors.get(current_id, ()):
+                if next_id not in visited and depth < max_depth:
+                    queue.append((next_id, depth + 1))
         
         # Sort by depth for upstream (most distant first) and downstream (closest first)
         if direction == "upstream":
@@ -3898,11 +4201,13 @@ class ContextGraph:
             
             # Community detection
             if "community_detector" in self.kg_components:
-                communities = self.kg_components["community_detector"].detect_communities(kg_graph)
+                community_detector = self.kg_components["community_detector"]
+                community_result = community_detector.detect_communities(kg_graph)
+                communities = community_result["communities"]
                 analysis["community_analysis"] = {
                     "communities": communities,
                     "num_communities": len(communities),
-                    "modularity": self._calculate_modularity(communities)
+                    "modularity": community_result.get("modularity", 0.0)
                 }
             
             # Connectivity analysis
@@ -4068,11 +4373,6 @@ class ContextGraph:
             distribution[edge.edge_type] += 1
         return dict(distribution)
     
-    def _calculate_modularity(self, communities: Dict) -> float:
-        """Calculate modularity for communities (simplified)."""
-        # Placeholder for modularity calculation
-        return 0.5
-    
     def _get_node_subgraph(self, node_id: str, max_depth: int = 2) -> Dict[str, Any]:
         """Get subgraph around a node."""
         neighbors = self.get_neighbors(node_id, hops=max_depth)
@@ -4137,6 +4437,7 @@ class ContextGraph:
         metadata: Optional[Dict[str, Any]] = None,
         valid_from: Optional[Union[str, int, float, datetime]] = None,
         valid_until: Optional[Union[str, int, float, datetime]] = None,
+        decision_id: Optional[str] = None,
         evaluators: Optional[List[Any]] = None,
         eval_config: Optional[Dict[str, Any]] = None,
         **kwargs
@@ -4153,8 +4454,11 @@ class ContextGraph:
             entities: Related entities
             decision_maker: Who made the decision
             metadata: Additional metadata
-            valid_from: Optional valid from timestamp
-            valid_until: Optional valid until timestamp
+            valid_from: Start of the decision's validity window
+            valid_until: End of the decision's validity window
+            decision_id: Optional pre-generated decision ID. When omitted, a
+                UUID is generated. A caller-supplied ID must not already
+                exist in this graph.
             evaluators: Optional list of evaluators
             eval_config: Optional evaluator configuration dictionary
             **kwargs: Additional decision data
@@ -4221,12 +4525,25 @@ class ContextGraph:
         for key, value in kwargs.items():
             if not isinstance(key, str) or not key.strip():
                 raise ValueError("Additional field names must be non-empty strings")
+            if key == "id":
+                # kwargs are merged last into the decision mapping, so an "id"
+                # would replace the generated one and the returned id would no
+                # longer name the stored node.
+                raise ValueError("'id' is reserved; the decision id is generated")
             if len(key.strip()) > 100:
                 raise ValueError("Additional field names must be 100 characters or less")
             if len(str(value)) > 1000:
                 raise ValueError("Additional field values must be 1000 characters or less")
         
-        decision_id = str(uuid.uuid4())
+        if decision_id is not None:
+            if not isinstance(decision_id, str) or not decision_id.strip():
+                raise ValueError("Decision ID must be a non-empty string")
+            if decision_id in self.nodes or decision_id in getattr(
+                self, "_decisions", {}
+            ):
+                raise ValueError(f"Decision ID {decision_id!r} already exists")
+        else:
+            decision_id = str(uuid.uuid4())
         timestamp = datetime.now().timestamp()
         
         # Sanitize inputs
@@ -4271,6 +4588,14 @@ class ContextGraph:
                 d_obj, active_evaluators, active_eval_config, logger=self.logger
             )
             if eval_results:
+                if "eval_details" in eval_results and len(str(eval_results["eval_details"])) > 1000:
+                    self.logger.warning(
+                        f"Decision evaluation details for {decision_id} exceed "
+                        "ContextGraph's metadata value limit; storing eval_score and "
+                        "eval_passed without eval_details"
+                    )
+                    eval_results = dict(eval_results)
+                    eval_results.pop("eval_details", None)
                 metadata = {**(metadata or {}), **eval_results}
         
         # Create decision record
@@ -4357,6 +4682,14 @@ class ContextGraph:
                 entity_candidates.update(self._entity_index.get(entity, set()))
             candidates = candidates.intersection(entity_candidates)
         
+        # Reuse a query-local snapshot of node types and outgoing degrees. The
+        # structural score is the maximum over all other nodes, so scanning and
+        # sorting the entire graph once per decision is unnecessary.
+        structural_scores = (
+            self._precedent_structural_scores(candidates)
+            if self.config.get("advanced_analytics") else {}
+        )
+
         # Calculate similarities
         precedents = []
         for decision_id in candidates:
@@ -4372,9 +4705,7 @@ class ContextGraph:
             content_sim = self._calculate_decision_content_similarity(scenario, decision)
             
             # Structural similarity (graph-based)
-            structural_sim = 0.0
-            if self.config.get("advanced_analytics"):
-                structural_sim = self._calculate_structural_similarity_for_decision(decision_id, scenario)
+            structural_sim = structural_scores.get(decision_id, 0.0)
             
             # Combined similarity
             combined_sim = 0.7 * content_sim + 0.3 * structural_sim
@@ -4637,14 +4968,18 @@ class ContextGraph:
 
                 # Find potential causes (decisions that influenced this one) via
                 # shared entities/timestamps - additive heuristic, skipping anything
-                # already covered by an explicit relationship above.
-                potential_causes = []
+                # already covered by an explicit relationship above. Deduplicate by
+                # decision id (dict preserves insertion order): a decision sharing
+                # several entities with the current one is one potential cause,
+                # not one per shared entity, otherwise the trace reports the same
+                # "influences" chain once per overlapping entity.
+                potential_causes = {}
                 for entity in current_decision["entities"]:
                     for other_decision_id in self._entity_index.get(entity, set()):
                         if other_decision_id != current_id and other_decision_id not in explicit_cause_ids:
                             other_decision = self._decisions[other_decision_id]
-                            if other_decision["timestamp"] < current_decision["timestamp"]:
-                                potential_causes.append(other_decision_id)
+                            if self._decision_sort_ts(other_decision["timestamp"]) < self._decision_sort_ts(current_decision["timestamp"]):
+                                potential_causes[other_decision_id] = None
 
                 for cause_id in potential_causes:
                     cause_dec = self._decisions.get(cause_id, {})
@@ -4714,7 +5049,7 @@ class ContextGraph:
             "min_confidence": 0.7,
             "required_outcomes": ["approved", "rejected", "flagged"],
             "required_metadata": ["decision_maker"],
-            "max_reasoning_length": 1000
+            "max_reasoning_length": 10000
         }
         
         rules = policy_rules or default_rules
@@ -4734,8 +5069,8 @@ class ContextGraph:
         
         # Check reasoning length
         reasoning = decision_data.get("reasoning", "")
-        if len(reasoning) > rules.get("max_reasoning_length", 1000):
-            warnings.append(f"Reasoning too long: {len(reasoning)} characters")
+        if len(reasoning.strip()) > rules.get("max_reasoning_length", 10000):
+            warnings.append(f"Reasoning too long: {len(reasoning.strip())} characters")
         
         return {
             "compliant": len(violations) == 0,
@@ -4747,111 +5082,136 @@ class ContextGraph:
     # --- Private helper methods for decision management ---
     
     def _add_decision_to_graph(self, decision: Dict[str, Any]) -> None:
-        """Add decision to context graph."""
-        try:
-            protected_properties = {
-                "category",
-                "scenario",
-                "reasoning",
-                "outcome",
-                "confidence",
-                "timestamp",
-                "decision_maker",
-            }
-            safe_metadata = {
-                key: value
-                for key, value in (decision.get("metadata") or {}).items()
-                if key not in protected_properties
-            }
-            extra_properties = {
-                key: value
-                for key, value in decision.items()
-                if key not in {
-                    "id",
-                    "category",
-                    "scenario",
-                    "reasoning",
-                    "outcome",
-                    "confidence",
-                    "entities",
-                    "decision_maker",
-                    "timestamp",
-                    "recorded_at",
-                    "valid_from",
-                    "valid_until",
-                    "metadata",
-                }
-            }
-            # Add decision node
-            self.add_node(
-                decision["id"],
-                "decision",
-                content=decision["scenario"],
-                valid_from=decision.get("valid_from"),
-                valid_until=decision.get("valid_until"),
-                category=decision["category"],
-                outcome=decision["outcome"],
-                confidence=decision["confidence"],
-                timestamp=decision["timestamp"],
-                scenario=decision["scenario"],
-                decision_maker=decision.get("decision_maker", ""),
-                reasoning=decision["reasoning"],
-                recorded_at=decision.get("recorded_at", ""),
-                **safe_metadata,
-                **extra_properties,
-            )
-            
-            # Add entity nodes and relationships
-            for entity in decision["entities"]:
-                # Add entity node if not exists
-                if not self.find_node(entity):
-                    self.add_node(
+        """Add decision to context graph.
+
+        All-or-nothing: on any failure the nodes and edges created by this call
+        are removed again and the exception is re-raised, so a decision is
+        never left half-stored and ``record_decision`` never reports success
+        for one that is not in the graph.
+        """
+        # Every name add_node() receives other than through **properties, plus
+        # the keywords passed explicitly below. A metadata key or **kwargs
+        # entry under one of these names would arrive twice and raise
+        # TypeError, so both mappings are filtered by the same set. "self" is
+        # included because a bound method rejects it as a keyword too.
+        node_properties = {
+            "self",
+            "node_id",
+            "node_type",
+            "content",
+            "category",
+            "scenario",
+            "reasoning",
+            "outcome",
+            "confidence",
+            "timestamp",
+            "decision_maker",
+            "recorded_at",
+            "valid_from",
+            "valid_until",
+        }
+        # Keys of the decision mapping handled structurally, not as node
+        # properties.
+        structural_keys = {"id", "entities", "metadata"}
+        safe_metadata = {
+            key: value
+            for key, value in (decision.get("metadata") or {}).items()
+            if key not in node_properties
+        }
+        extra_properties = {
+            key: value
+            for key, value in decision.items()
+            if key not in node_properties and key not in structural_keys
+        }
+
+        with self._lock:
+            nodes_before = set(self.nodes)
+            edges_before = len(self.edges)
+            try:
+                # Add decision node
+                if not self.add_node(
+                    decision["id"],
+                    "decision",
+                    content=decision["scenario"],
+                    valid_from=decision.get("valid_from"),
+                    valid_until=decision.get("valid_until"),
+                    category=decision["category"],
+                    outcome=decision["outcome"],
+                    confidence=decision["confidence"],
+                    timestamp=decision["timestamp"],
+                    scenario=decision["scenario"],
+                    decision_maker=decision.get("decision_maker", ""),
+                    reasoning=decision["reasoning"],
+                    recorded_at=decision.get("recorded_at", ""),
+                    **safe_metadata,
+                    **extra_properties,
+                ):
+                    raise ValueError(
+                        f"Decision node {decision['id']!r} was rejected by the graph"
+                    )
+
+                # Add entity nodes and relationships
+                for entity in decision["entities"]:
+                    # Add entity node if not exists
+                    if not self.find_node(entity):
+                        self.add_node(
+                            entity,
+                            "entity",
+                            name=entity
+                        )
+
+                    # Add relationship
+                    self.add_edge(
+                        decision["id"],
                         entity,
-                        "entity",
-                        name=entity
+                        "involves",
+                        confidence=decision["confidence"]
                     )
-                
-                # Add relationship
-                self.add_edge(
-                    decision["id"],
-                    entity,
-                    "involves",
-                    confidence=decision["confidence"]
-                )
-            
-            # Add category node and relationship
-            category_id = f"category_{decision['category']}"
-            if not self.find_node(category_id):
-                self.add_node(
-                    category_id,
-                    "category",
-                    name=decision["category"]
-                )
-            
-            self.add_edge(
-                decision["id"],
-                category_id,
-                "belongs_to"
-            )
-            
-            # Add decision maker node if provided
-            if decision.get("decision_maker"):
-                maker_id = f"maker_{decision['decision_maker']}"
-                if not self.find_node(maker_id):
+
+                # Add category node and relationship
+                category_id = f"category_{decision['category']}"
+                if not self.find_node(category_id):
                     self.add_node(
-                        maker_id,
-                        "decision_maker",
-                        name=decision["decision_maker"]
+                        category_id,
+                        "category",
+                        name=decision["category"]
                     )
-                
+
                 self.add_edge(
                     decision["id"],
-                    maker_id,
-                    "made_by"
+                    category_id,
+                    "belongs_to"
                 )
-            
-        except Exception as e:
-            self.logger.exception("Failed to add decision to graph")
+
+                # Add decision maker node if provided
+                if decision.get("decision_maker"):
+                    maker_id = f"maker_{decision['decision_maker']}"
+                    if not self.find_node(maker_id):
+                        self.add_node(
+                            maker_id,
+                            "decision_maker",
+                            name=decision["decision_maker"]
+                        )
+
+                    self.add_edge(
+                        decision["id"],
+                        maker_id,
+                        "made_by"
+                    )
+
+            except Exception:
+                # Do not swallow this. record_decision() has already generated
+                # the id it is about to return, so a silent failure here hands
+                # the caller a plausible identifier for a decision that is not
+                # in the graph. Undo the partial write first so a retry does
+                # not stack a second decision on top of orphaned nodes/edges.
+                self.logger.exception("Failed to add decision to graph")
+                for edge in list(self.edges[edges_before:]):
+                    self._drop_edge_from_indexes(edge)
+                    self._edge_index.pop(edge.edge_id, None)
+                for node_id in set(self.nodes) - nodes_before:
+                    self._drop_node_from_indexes(node_id)
+                raise
 
     def _decision_matches_temporal_filters(
         self,
@@ -4888,6 +5248,31 @@ class ContextGraph:
         "entities", "decision_maker", "timestamp", "recorded_at",
         "valid_from", "valid_until", "content",
     })
+
+    @staticmethod
+    def _decision_sort_ts(raw_ts: Any) -> float:
+        """Epoch seconds for ``_temporal_index`` ordering.
+
+        Accepts epoch numbers (``record_decision``) and ISO strings
+        (``add_decision`` with a ``Decision`` object); anything unparseable
+        sorts as ``0.0``. A trailing ``Z`` is read as UTC; other naive values
+        use local time, matching ``record_decision``'s ``datetime.now()``.
+        """
+        if isinstance(raw_ts, datetime):
+            return raw_ts.timestamp()
+        try:
+            return float(raw_ts)
+        except (TypeError, ValueError):
+            pass
+        if isinstance(raw_ts, str):
+            try:
+                text = raw_ts.strip()
+                if text.endswith(("Z", "z")):
+                    text = text[:-1] + "+00:00"
+                return datetime.fromisoformat(text).timestamp()
+            except ValueError:
+                pass
+        return 0.0
 
     def _rebuild_decision_indexes(self) -> None:
         """Rebuild all derived decision indexes from the current node store.
@@ -4927,10 +5312,7 @@ class ContextGraph:
             # The temporal index uses it for sorting; downstream code handles
             # both types via _normalize_timestamp.
             raw_ts = meta.get("timestamp", 0.0)
-            try:
-                sort_ts = float(raw_ts)
-            except (TypeError, ValueError):
-                sort_ts = 0.0
+            sort_ts = self._decision_sort_ts(raw_ts)
 
             # Entities may be stored as a list in meta or inferred from
             # outgoing "involves" edges if the list field is absent/empty.
@@ -4986,32 +5368,42 @@ class ContextGraph:
     def _sync_decision_from_node(self, node_id: str) -> None:
         """Synchronise a single decision index entry from the node store.
 
-        Called after ``add_node_attribute`` mutates a decision node so that
-        ``_decisions`` and the derived indexes stay consistent without
-        requiring a full rebuild of all decisions.
+        Called after ``add_node_attribute`` mutates a decision node and after
+        ``apply_node_markdown`` replaces a node whose old or new type is
+        ``"decision"``, so that ``_decisions`` and the derived indexes stay
+        consistent without requiring a full rebuild of all decisions.
+
+        Temporal index cleanup (``_temporal_index``) runs unconditionally
+        before the node-type guard so that stale entries are removed even when
+        transitioning a decision node to a non-decision type.  Callers are
+        expected to ensure this is only invoked when at least one of the
+        current or previous node types is ``"decision"``; callers that bypass
+        that invariant will have ``node_id`` silently removed from
+        ``_temporal_index`` even if it was never a decision node.
         """
         node = self.nodes.get(node_id)
-        if node is None:
-            return
-        if (getattr(node, "node_type", None) or "").lower() != "decision":
-            return
-
         if not hasattr(self, "_decisions"):
             # Indexes don't exist yet — a full rebuild is safer.
             self._rebuild_decision_indexes()
             return
 
-        # Remove stale index entries for this decision ID.
-        old = self._decisions.get(node_id)
+        # Remove stale index entries before deciding whether the current node
+        # still belongs in the decision indexes.
+        old = self._decisions.pop(node_id, None)
         if old:
             old_cat = old.get("category", "")
-            if old_cat and node_id in self._decision_index.get(old_cat, set()):
+            if old_cat:
                 self._decision_index[old_cat].discard(node_id)
             for ent in old.get("entities", []):
                 self._entity_index[ent].discard(node_id)
-            self._temporal_index = [
-                (nid, ts) for nid, ts in self._temporal_index if nid != node_id
-            ]
+        self._temporal_index = [
+            (nid, ts) for nid, ts in self._temporal_index if nid != node_id
+        ]
+
+        if node is None:
+            return
+        if (getattr(node, "node_type", None) or "").lower() != "decision":
+            return
 
         # Rebuild the entry for this node and re-insert index entries.
         meta: Dict[str, Any] = {}
@@ -5019,10 +5411,7 @@ class ContextGraph:
         meta.update(getattr(node, "properties", {}) or {})
 
         raw_ts = meta.get("timestamp", 0.0)
-        try:
-            sort_ts = float(raw_ts)
-        except (TypeError, ValueError):
-            sort_ts = 0.0
+        sort_ts = self._decision_sort_ts(raw_ts)
 
         entities = meta.get("entities") or []
         if not isinstance(entities, list):
@@ -5093,6 +5482,34 @@ class ContextGraph:
     def _calculate_decision_content_similarity(self, scenario: str, decision: Dict[str, Any]) -> float:
         """Calculate content similarity between scenario and decision.
 
+        Signal hierarchy (applies to both the word and bigram channels):
+
+          PRIMARY   — Jaccard(query, decision.scenario)
+            The scenario field is the authoritative description of what the
+            decision was about.  Scoring against it first means a query that
+            is identical or very close to a stored scenario always scores high,
+            regardless of how long the reasoning or entity list is.
+
+          SECONDARY — 0.8 × Jaccard(query, scenario + reasoning + entities)
+            The full decision text is a useful fallback when the query overlaps
+            with reasoning or entity context rather than the scenario title.
+            The 0.8× discount is intentional: decisions whose scenario is
+            unrelated to the query but whose reasoning happens to restate the
+            query words are ranked lower than genuine scenario-level matches.
+            This also prevents verbose reasoning from diluting exact-scenario
+            queries below any reasonable threshold (#1140).
+
+            Practical consequence: a reasoning-only match scores at most
+            0.8 × full_text_jaccard.  At the find_similar_decisions default
+            threshold of 0.3 (combined_sim = 0.7 × content_sim), the
+            full_text_jaccard must be ≥ 0.54 to survive, compared to ≥ 0.43
+            without the discount.  Callers that depend on reasoning-heavy
+            matching should lower their threshold accordingly.
+
+          FINAL     — max(primary, secondary)
+            The higher of the two signals wins so that neither channel can
+            suppress a strong match from the other.
+
         Uses word-level Jaccard for space-separated languages.  For text where
         whitespace tokenisation is unreliable (CJK/Japanese/Korean scripts, or
         a query with no whitespace at all) a character-bigram Jaccard is
@@ -5117,16 +5534,23 @@ class ContextGraph:
                 f"{decision['scenario']} {decision['reasoning']} "
                 f"{' '.join(decision['entities'])}"
             )
+            decision_scenario_text = str(decision.get("scenario", ""))
+
+            def _word_jaccard(text: str) -> float:
+                words = set(text.lower().split())
+                union = scenario_words | words
+                return len(scenario_words & words) / len(union) if union else 0.0
 
             # --- word-level Jaccard (primary metric for Latin/space-delimited) ---
             scenario_words = set(scenario.lower().split())
-            decision_words = set(decision_text.lower().split())
-            word_union = scenario_words | decision_words
-            word_sim = (
-                len(scenario_words & decision_words) / len(word_union)
-                if word_union
-                else 0.0
-            )
+            # Jaccard against the full decision text is diluted by the reasoning
+            # and entity words: a query naming a decision's exact scenario could
+            # score below every reasonable threshold and return no precedent at
+            # all (#1140). Score the decision's own scenario first and keep the
+            # full-text score as a discounted secondary signal.
+            word_sim = _word_jaccard(decision_scenario_text)
+            full_text_word_sim = _word_jaccard(decision_text)
+            word_sim = max(word_sim, 0.8 * full_text_word_sim)
 
             # --- character-bigram Jaccard (CJK / very-short-query fallback) ---
             # Only used when whitespace tokenisation can't do the job: CJK-like
@@ -5140,7 +5564,13 @@ class ContextGraph:
             )
             if needs_bigram_fallback:
                 scenario_bigrams = self._char_bigrams(scenario)
-                decision_bigrams = self._char_bigrams(decision_text)
+
+                def _bigram_jaccard(text: str) -> float:
+                    bigrams = self._char_bigrams(text)
+                    if not bigrams:
+                        return 0.0
+                    union = scenario_bigrams | bigrams
+                    return len(scenario_bigrams & bigrams) / len(union) if union else 0.0
 
                 # Require at least 3 bigrams in the query before the bigram
                 # signal is used.  A 2-char query produces only 1 bigram; that
@@ -5149,12 +5579,13 @@ class ContextGraph:
                 # coefficient.  3 bigrams correspond to a 4-char stripped query
                 # (e.g. two CJK characters produce 1 bigram each → need ≥3
                 # chars stripped).
-                if len(scenario_bigrams) >= 3 and decision_bigrams:
-                    bigram_union = scenario_bigrams | decision_bigrams
-                    bigram_sim = (
-                        len(scenario_bigrams & decision_bigrams) / len(bigram_union)
-                        if bigram_union
-                        else 0.0
+                if len(scenario_bigrams) >= 3:
+                    # Same scenario-vs-full-text treatment as the word channel
+                    # above: the decision's own scenario must not be diluted
+                    # below threshold by its reasoning text (#1140).
+                    bigram_sim = max(
+                        _bigram_jaccard(decision_scenario_text),
+                        0.8 * _bigram_jaccard(decision_text),
                     )
 
             return max(word_sim, bigram_sim)
@@ -5163,6 +5594,48 @@ class ContextGraph:
             self.logger.exception("Content similarity calculation failed")
             return 0.0
     
+    def _precedent_structural_scores(self, decision_ids: Set[str]) -> Dict[str, float]:
+        """Return the existing structural score without per-decision graph scans.
+
+        ``find_similar_nodes(..., similarity_type="structural")`` compares node
+        type and outgoing degree. Its highest score is therefore determined by
+        the nearest *other* degree of the same type. Keep this index local to the
+        call so graph mutations and reloads cannot leave stale scores behind.
+        """
+        degree_counts: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        decision_degrees: Dict[str, Tuple[str, int]] = {}
+        with self._lock:
+            for node_id, node in self.nodes.items():
+                degree_counts[node.node_type][len(self._adjacency.get(node_id, ()))] += 1
+            for decision_id in decision_ids:
+                node = self.nodes.get(decision_id)
+                if node is not None:
+                    decision_degrees[decision_id] = (
+                        node.node_type,
+                        len(self._adjacency.get(decision_id, ())),
+                    )
+
+        sorted_degrees = {
+            node_type: sorted(counts)
+            for node_type, counts in degree_counts.items()
+        }
+        scores: Dict[str, float] = {}
+        for decision_id, (node_type, degree) in decision_degrees.items():
+            counts = degree_counts[node_type]
+            if counts[degree] > 1:
+                scores[decision_id] = 1.0
+                continue
+            degrees = sorted_degrees[node_type]
+            position = bisect_left(degrees, degree)
+            lower = degrees[position - 1] if position > 0 else None
+            upper = degrees[position + 1] if position + 1 < len(degrees) else None
+            scores[decision_id] = max(
+                (1.0 - abs(degree - other) / max(degree, other, 1)
+                 for other in (lower, upper) if other is not None),
+                default=0.0,
+            )
+        return scores
+
     def _calculate_structural_similarity_for_decision(self, decision_id: str, scenario: str) -> float:
         """Calculate structural similarity using graph algorithms."""
         try:
@@ -5261,7 +5734,12 @@ class ContextGraph:
             category_score = 1.0 if source_decision["category"] == target_decision["category"] else 0.0
             
             # Temporal proximity (more recent decisions have higher influence)
-            time_diff = abs(source_decision["timestamp"] - target_decision["timestamp"])
+            # Timestamps may be epoch floats (record_decision) or ISO strings
+            # (add_decision with a Decision object); compare as epoch seconds.
+            time_diff = abs(
+                self._decision_sort_ts(source_decision["timestamp"])
+                - self._decision_sort_ts(target_decision["timestamp"])
+            )
             time_score = max(0.0, 1.0 - time_diff / (30 * 24 * 3600))  # 30 days window
             
             # Combined score

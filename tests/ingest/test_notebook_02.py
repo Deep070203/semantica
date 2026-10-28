@@ -1,18 +1,22 @@
 import os
 import tempfile
-import pytest
 import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from semantica.ingest import (
+import pytest
+
+# WebIngestor/FeedIngestor need beautifulsoup4 (the optional documents
+# extra); semantica.ingest raises ImportError for them without it.
+pytest.importorskip("bs4")
+
+from semantica.ingest import (  # noqa: E402
     ingest, 
     FileIngestor, FileTypeDetector, CloudStorageIngestor,
     WebIngestor, ContentExtractor, SitemapCrawler, RobotsChecker,
     FeedIngestor, FeedMonitor,
     StreamIngestor, StreamMonitor,
-    RepoIngestor, CodeExtractor, GitAnalyzer,
     EmailIngestor, AttachmentProcessor,
     DBIngestor, DatabaseConnector,
     MCPIngestor, IngestConfig, ingest_config
@@ -140,6 +144,9 @@ class TestNotebook02DataIngestion:
         assert 'overall' in health
 
     def test_06_repo_ingestion(self):
+        pytest.importorskip("git")
+        from semantica.ingest import CodeExtractor, RepoIngestor
+
         code_extractor = CodeExtractor()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as tmp:
             tmp.write("class MyClass:\n    def my_method(self):\n        pass")

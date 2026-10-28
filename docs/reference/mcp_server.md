@@ -306,7 +306,7 @@ Find past decisions similar to a given scenario using hybrid similarity search.
 
 <Accordion title="get_causal_chain" icon="diagram-project">
 
-Trace the causal chain upstream or downstream from a decision.
+Trace the causal chain upstream, downstream or both from a decision.
 
 **Input:**
 
@@ -314,7 +314,7 @@ Trace the causal chain upstream or downstream from a decision.
 { "decision_id": "dec_a1b2c3", "direction": "downstream", "max_depth": 5 }
 ```
 
-`direction` accepts `"upstream"` or `"downstream"` (default: `"downstream"`).
+`direction` accepts `"upstream"`, `"downstream"` or `"both"` (default: `"downstream"`). With `"both"`, the result lists the causes (farthest first) and then the effects (nearest first); each decision appears once and carries `metadata.causal_direction`.
 `max_depth` defaults to `5`, maximum `20`.
 
 </Accordion>
@@ -495,5 +495,5 @@ The MCP server exposes three readable resources:
 
 - [Context](/reference/context) — The ContextGraph that the MCP server operates on.
 - [Semantic Extract](/reference/semantic_extract) — NER and relation extraction powering the MCP tools.
-- [Reasoning](reasoning) — Forward-chaining engine behind run_reasoning.
+- [Reasoning](/reference/reasoning) — Forward-chaining engine behind run_reasoning.
 - [Agno Integration](../integrations/agno) — Use Semantica inside Agno multi-agent teams.
