@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tornado` was pinned at 6.5.10, which the audit job now flags three times** (fixes #2135) by @pkupt
+  - `CVE-2026-115927`, `CVE-2026-116577` and `CVE-2026-116578` all resolve to `tornado==6.5.10`, and they are the only findings left in `requirements-ci.txt`. Because `security-scan` is a required check, they failed every pull request's run, and the scheduled scan on `main` failed for the same three
+  - `requirements-ci.txt` and `uv.lock` now carry `tornado==6.6`, the first release with fixes for all three. Nothing else in either file moves: both were re-resolved with the committed pins as constraints, and the two CI freshness gates (`uv pip compile` against `requirements-ci.txt`, `uv lock --check`) pass unchanged
+
 - **Provenance checksums were not injective: two records that differed only in where a field boundary fell hashed the same** (fixes #2136) by @pkupt
   - `compute_checksum()` pasted the 16 hashed fields together with nothing between them, so `{"entity_type": "ab", "activity_id": "c"}` and `{"entity_type": "a", "activity_id": "bc"}` produced the same digest, and a row rewritten across a field boundary still passed `verify_checksum()` and `verify_chain()`. `used_entities` had the same hole once joined: `["a,b"]` and `["a", "b"]` collided
   - The v2 encoding writes a `prov-v2\0` header, then every value as a 1-byte type tag, a 4-byte big-endian length and the UTF-8 bytes; lists carry an element count and each element is length-prefixed in turn, so a boundary cannot move. It also settles a divergence v1 left open: a `None` field hashed as `''` through the dict path but as `'None'` through the dataclass path, so one record could hash two ways
