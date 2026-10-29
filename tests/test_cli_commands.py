@@ -5784,6 +5784,79 @@ class TestOntologyAlignOutput:
         assert "alignments" in df.columns
 
 
+class TestProvenanceCliStorageEnv:
+    """#1810: `semantica provenance audit` must read the DB the Explorer writes.
+
+    The CLI builds ``ProvenanceManager(config=...)`` with no storage path, so
+    before the fix every read command inspected a fresh in-memory store and the
+    env var the Explorer honours was invisible to it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_storage(self, monkeypatch):
+        from semantica.provenance import ProvenanceManager
+
+        monkeypatch.delenv("SEMANTICA_PROVENANCE_DB", raising=False)
+        monkeypatch.delenv("EXPLORER_PROVENANCE_DB", raising=False)
+        original = ProvenanceManager._default_storage_path
+        ProvenanceManager._default_storage_path = None
+        try:
+            yield
+        finally:
+            ProvenanceManager._default_storage_path = original
+
+    @staticmethod
+    def _seed_db(path):
+        from semantica.provenance import ProvenanceManager
+
+        writer = ProvenanceManager(storage_path=str(path))
+        writer.track_entity(
+            entity_id="ent1", source="t.py", activity="creation", agent="tester"
+        )
+        writer.track_entity(
+            entity_id="ent2", source="t.py", activity="creation", agent="tester"
+        )
+
+    def test_audit_reads_the_db_named_by_the_env_var(
+        self, runner, monkeypatch, tmp_path
+    ):
+        db = tmp_path / "cli_prov.db"
+        self._seed_db(db)
+        monkeypatch.setenv("SEMANTICA_PROVENANCE_DB", str(db))
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "audit", "--format", "json", "--json"]
+        )
+        _ok(result)
+        entries = json.loads(result.output.strip())
+        assert [e["entity_id"] for e in entries] == ["ent1", "ent2"]
+
+    def test_audit_is_empty_when_no_env_var_points_at_a_db(self, runner, tmp_path):
+        self._seed_db(tmp_path / "cli_prov.db")
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "audit", "--format", "json", "--json"]
+        )
+        _ok(result)
+        assert json.loads(result.output.strip()) == []
+
+    def test_configured_storage_path_wins_over_the_env_var(
+        self, runner, monkeypatch, tmp_path
+    ):
+        configured = tmp_path / "configured.db"
+        self._seed_db(configured)
+        monkeypatch.setenv("SEMANTICA_PROVENANCE__STORAGE_PATH", str(configured))
+        monkeypatch.setenv("SEMANTICA_PROVENANCE_DB", str(tmp_path / "other.db"))
+
+        result = runner.invoke(
+            cli_module.main, ["provenance", "audit", "--format", "json", "--json"]
+        )
+        _ok(result)
+        entries = json.loads(result.output.strip())
+        assert [e["entity_id"] for e in entries] == ["ent1", "ent2"]
+        assert not (tmp_path / "other.db").exists()
+
+
 class _FakeUrlopenResponse:
     """Minimal context-manager response for a stubbed urllib.request.urlopen."""
 
