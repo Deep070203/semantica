@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`pyasn1` was pinned at 0.6.4, which the audit job now flags four times** (fixes #2182) by @sakshi04-ui
+  - `CVE-2026-119194`, `CVE-2026-119195`, `CVE-2026-119196` and `CVE-2026-119197` all resolve to `pyasn1==0.6.4`, pulled in through `google-auth` → `pyasn1-modules`. They are the only findings in `requirements-ci.txt` outside the accepted `opentelemetry-api` advisory, and the scheduled scan on `main` has failed on them since 2026-10-31
+  - `requirements-ci.txt` and `uv.lock` now carry `pyasn1==0.6.5`, the latest release and the first with fixes for all four. Nothing else moves: both files were re-resolved with only `pyasn1` upgraded, and the CI freshness gates (`uv pip compile` against `requirements-ci.txt` and `open-ontologies-extra.txt`, `uv lock --check`) pass unchanged
+
+- **`joserfc` was pinned at 1.7.5, which the audit job now flags** by @Sameer6305
+  - `CVE-2026-119284` (`GHSA-9pg5-8c7x-5hfx`): the compact JWS size guard allocated attacker-controlled segments before rejecting them. It is the only finding in `requirements-ci.txt`, so `security-scan` failed every pull request opened after the advisory landed
+  - `requirements-ci.txt` and `uv.lock` now carry `joserfc==1.7.7`; 1.7.6 is the first fixed release. Nothing else moves: both files were re-resolved with only `joserfc` upgraded
+
+- **Parquet and Arrow relationship export lost graph-backend endpoint names** (refs #2018) by @george07-t
+  - `ParquetExporter.export_relationships()` and `ArrowExporter.export_relationships()` read only `source`/`source_id` and `target`/`target_id`, so a record shaped by a graph backend (`start_node_id`/`end_node_id` from Neo4j, FalkorDB and Neptune, `start_id`/`end_id` from raw AGE edges) made Parquet raise `ValidationError` and wrote Arrow rows with empty `source_id` and `target_id`. Both now run the records through `canonical_endpoints` first, so the shared list, order and empty-value rule apply; Parquet keeps its `from_id`/`from`/`to_id`/`to` fallbacks, and an integer id of `0` is now kept as a real id in both, as the shared helper treats it (it used to be dropped by their `or` chains)
+  - New tests in `tests/export/test_columnar_exporters_endpoint_names.py` read the written files back for every accepted spelling, an empty canonical value, precedence, an id of `0`, untouched input and mixed batches
+
 - **`DomainOntologies` advertised legal, research and cybersecurity templates that did not exist** (fixes #1819) by @pkupt
   - `get_domain_template("legal")`, `("research")` and `("cybersecurity")` returned a bare `None`, which surfaced in caller code as `AttributeError: 'NoneType' object has no attribute 'get'`. The three templates are now registered, in the same small hand-written style as `healthcare` and `finance`.
   - `get_domain_template` still returns `None` for an unregistered domain, but now logs a warning listing the available domains so the miss is visible. New `tests/ontology/test_domain_ontologies.py`
@@ -112,6 +124,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `POST /api/graph/distance-matrix` mirrored one `src`→`tgt` result into both matrix cells, reporting the reverse direction as reachable on a directed graph. Each direction is now searched independently, so the matrix may be asymmetric and `unreachable_pairs` lists the specific ordered pairs that have no path
   - Undirected traversal (`directed=false`) can walk a stored edge backwards; `total_weight` costed those hops against the directed view and fell back to the default `1.0`, and `resolve_path_edge_ids` scanned only outgoing adjacency so the hop contributed no id. Both now resolve reverse hops, and the reported edge is the lowest-weight parallel edge — the one the path is costed against
   - `POST /api/graph/distance-matrix` rebuilt the whole graph once per node pair; it is now built once per request
+
+- **`semantica provenance` commands ignored the persisted provenance DB** (fixes #1810) by @pkupt
+  - Every subcommand built `ProvenanceManager(config=...)` with no storage path, so `audit`, `verify-chain`, `check`, `lineage`, `descendants` and `export` read a fresh in-memory store and reported nothing, and `invalidate` failed with "no provenance entry found". `SEMANTICA_PROVENANCE_DB` was read only by the Explorer.
+  - The CLI now resolves its store as: configured `provenance.storage_path`, then `SEMANTICA_PROVENANCE_DB`, then `EXPLORER_PROVENANCE_DB`, then in-memory. The env lookup lives in one place, `semantica.provenance.storage_path_from_env()`, which the Explorer also uses, so the two agree on one database.
+  - `ProvenanceManager()` itself still ignores the env vars, so library callers and the module-level trackers keep their explicit or in-memory storage.
 
 ### Security
 
